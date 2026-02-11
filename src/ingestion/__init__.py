@@ -30,6 +30,14 @@ from src.ingestion.parsing import (
     ParsedMarkdownDocument,
     Tier2DoclingParser,
 )
+from src.ingestion.orchestration import (
+    EmbeddingBundle,
+    IngestionEvent,
+    IngestionOrchestrator,
+    IngestionRecord,
+    PipelineError,
+    RetryableStageError,
+)
 from src.ingestion.uploads import UploadIntakeError, UploadIntakeService
 
 __all__ = [
@@ -46,6 +54,9 @@ __all__ = [
     "IndexRecord",
     "IndexSchema",
     "IndexingError",
+    "IngestionEvent",
+    "IngestionOrchestrator",
+    "IngestionRecord",
     "LayoutParsingError",
     "PageText",
     "ParentChildChunker",
@@ -54,9 +65,11 @@ __all__ = [
     "ParsedMarkdownDocument",
     "QueryMatch",
     "RedisVLIndexBackend",
+    "RetryableStageError",
     "TextExtractionError",
     "Tier1TextExtractor",
     "Tier2DoclingParser",
+    "PipelineError",
     "UploadIntakeError",
     "UploadIntakeService",
 ]
