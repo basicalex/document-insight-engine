@@ -1,0 +1,11 @@
+.git
+.gitignore
+.aoc
+.taskmaster
+.opencode
+__pycache__
+.pytest_cache
+tests
+*.pyc
+data
+models

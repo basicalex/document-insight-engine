@@ -1,0 +1,58 @@
+services:
+  redis:
+    image: redis/redis-stack-server:7.2.0-v16
+    command: ["redis-server", "--appendonly", "yes", "--save", "60", "1000"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 1g
+
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ./models:/root/.ollama
+      - ./data:/data
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 20s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 6g
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      OLLAMA_BASE_URL: http://ollama:11434
+      DATA_DIR: /app/data
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      ollama:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    mem_limit: 2g
+
+volumes:
+  redis_data:
