@@ -16,7 +16,8 @@ Current state:
 - Foundation + infrastructure are implemented.
 - Ingestion pipeline is implemented (`/ingest` currently available).
 - Engine internals for local QA, agent loop guard, and Tier 4 extraction are implemented.
-- API contract finalization for `/ask` and `/upload` aliasing is next.
+- API contracts for `/ingest` and `/ask` are implemented with validation and guardrails.
+- Streamlit chat UI is available in `frontend/app.py` with mode toggle and trace viewer.
 
 ## Included dummy test docs (committed)
 
@@ -35,6 +36,13 @@ These are synthetic fixtures and contain no sensitive data.
 python -m pip install -e .[dev]
 python -m pytest
 uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+```
+
+Run Streamlit UI (in another terminal):
+
+```bash
+python -m pip install -e .[ui]
+streamlit run frontend/app.py
 ```
 
 Health check:
@@ -61,10 +69,10 @@ Current API endpoints:
 
 - `GET /healthz`
 - `POST /ingest`
+- `POST /ask`
 
 Planned/next API endpoints:
 
-- `POST /ask`
 - `POST /upload` (alias/contract alignment)
 
 Target contract examples:
