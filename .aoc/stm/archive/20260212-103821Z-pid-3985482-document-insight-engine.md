@@ -1,0 +1,3 @@
+- [2026-02-12 11:38] Handoff: Completed task 13 API contracts. Added guarded POST /ingest and POST /ask in src/api/main.py with correlation-id middleware, normalized ErrorEnvelope responses, timeout guardrails, and Idempotency-Key replay semantics.
+- [2026-02-12 11:38] Validation: Added tests/test_api.py for ingest happy path, idempotent replay, malformed payload handling, mode routing, and ask timeout. Full pytest passing: 55/55.
+- [2026-02-12 11:38] Commit: 211ed8a (Add guarded /ingest and /ask API contracts). Next recommended work: task 14 Streamlit chat UI. Note: worktree still has unstaged AOC/Taskmaster state files (.aoc/memory.md, .taskmaster/tasks/tasks.json, .taskmaster/state.json, .opencode/skills/.aoc-skill-sync).
