@@ -15,8 +15,10 @@ Current state:
 
 - Foundation + infrastructure are implemented.
 - Ingestion pipeline is implemented (`/ingest` currently available).
+- `/ingest` now executes extract -> parse -> chunk -> embed -> index before returning status.
 - Engine internals for local QA, agent loop guard, and Tier 4 extraction are implemented.
 - API contracts for `/ingest` and `/ask` are implemented with validation and guardrails.
+- `POST /upload` alias is available for assignment-compatible upload calls.
 - Streamlit chat UI is available in `frontend/app.py` with mode toggle and trace viewer.
 
 ## Included dummy test docs (committed)
@@ -63,21 +65,28 @@ Services started by compose:
 - `redis` (persistent volume)
 - `ollama` (model cache mounted under `./models`)
 
-## API status and target contracts
+## API status and contracts
 
 Current API endpoints:
 
 - `GET /healthz`
 - `POST /ingest`
+- `GET /ingest/{document_id}`
+- `POST /upload`
 - `POST /ask`
 
 Planned/next API endpoints:
 
-- `POST /upload` (alias/contract alignment)
+- Real deep-mode provider integration beyond fallback scripted behavior
 
-Target contract examples:
+Deep mode capability:
 
-Upload request (planned):
+- Deep mode is disabled by default at runtime.
+- Enable with env vars: `DEEP_MODE_ENABLED=true` and `CLOUD_AGENT_PROVIDER=fallback`.
+
+Contract examples:
+
+Upload request:
 
 ```bash
 curl -X POST http://localhost:8000/upload \
@@ -95,7 +104,7 @@ Expected upload response shape:
 }
 ```
 
-Ask request (planned):
+Ask request:
 
 ```bash
 curl -X POST http://localhost:8000/ask \
@@ -133,6 +142,71 @@ Expected ask response shape:
 - **Extraction**: PyMuPDF first, OCR fallback path for scanned/image-like docs.
 - **QA/RAG**: Local QA baseline + optional deeper retrieval/agentic path.
 - **Infra**: Docker Compose with Redis + Ollama + API, with persistence and limits.
+
+## Docker manual verification checklist
+
+Use this checklist to validate end-to-end behavior manually.
+
+1) Start services and wait for health checks:
+
+```bash
+docker compose up --build -d
+docker compose ps
+```
+
+2) Validate API and Redis reachability:
+
+```bash
+curl http://localhost:8000/healthz
+docker compose exec redis redis-cli ping
+```
+
+3) Upload one document with assignment endpoint:
+
+```bash
+curl -X POST http://localhost:8000/upload \
+  -F "file=@tests/data/documents/dummy_invoice.pdf;type=application/pdf"
+```
+
+4) Upload multiple documents in one request:
+
+```bash
+curl -X POST http://localhost:8000/upload \
+  -F "files=@tests/data/documents/dummy_invoice.pdf;type=application/pdf" \
+  -F "files=@tests/data/documents/dummy_contract.pdf;type=application/pdf"
+```
+
+5) Query ingestion status for a document:
+
+```bash
+curl http://localhost:8000/ingest/<document_id>
+```
+
+6) Ask grounded question in fast mode:
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "What is the total due?",
+    "mode": "fast",
+    "document_id": "<document_id>"
+  }'
+```
+
+7) Restart API and re-check persistence:
+
+```bash
+docker compose restart api
+curl http://localhost:8000/ingest/<document_id>
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "What is the total due?",
+    "mode": "fast",
+    "document_id": "<document_id>"
+  }'
+```
 
 ## Engine components (implemented)
 

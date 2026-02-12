@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import re
 import time
 from dataclasses import dataclass
@@ -11,6 +10,7 @@ from urllib import request as urllib_request
 
 from src.config.settings import Settings, settings
 from src.ingestion.indexing import EmbeddingTier, QueryMatch
+from src.ingestion.vectorize import hashing_vector
 from src.models.schemas import AgentTrace, ChatResponse, Citation, Mode, TraceEvent
 
 
@@ -49,21 +49,7 @@ class RetrievedEvidence:
 
 class HashingQueryEmbedder:
     def embed_query(self, text: str, dimension: int) -> list[float]:
-        if dimension <= 0:
-            raise ValueError("dimension must be positive")
-        vector = [0.0 for _ in range(dimension)]
-        tokens = _tokenize(text)
-        if not tokens:
-            return vector
-
-        for token in tokens:
-            index = hash(token) % dimension
-            vector[index] += 1.0
-
-        norm = math.sqrt(sum(value * value for value in vector))
-        if norm == 0:
-            return vector
-        return [value / norm for value in vector]
+        return hashing_vector(text=text, dimension=dimension)
 
 
 class OllamaHTTPClient:

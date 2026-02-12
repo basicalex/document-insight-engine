@@ -11,6 +11,7 @@ from src.models.schemas import (
     IngestionStatus,
     Mode,
     TraceEvent,
+    UploadBatchResponse,
 )
 
 __all__ = [
@@ -24,4 +25,5 @@ __all__ = [
     "IngestionStatus",
     "Mode",
     "TraceEvent",
+    "UploadBatchResponse",
 ]

@@ -85,6 +85,77 @@ def test_ask_sends_payload_and_returns_answer() -> None:
     assert response["trace"]["iterations"] == 1
 
 
+def test_upload_supports_multi_document_batch_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/upload"
+        assert request.headers["content-type"].startswith("multipart/form-data")
+        return httpx.Response(
+            201,
+            json={
+                "documents": [
+                    {
+                        "document_id": "doc_1",
+                        "file_path": "data/uploads/doc_1_invoice.pdf",
+                        "status": "indexed",
+                        "message": "indexed and ready for retrieval",
+                    },
+                    {
+                        "document_id": "doc_2",
+                        "file_path": "data/uploads/doc_2_contract.pdf",
+                        "status": "indexed",
+                        "message": "indexed and ready for retrieval",
+                    },
+                ],
+                "count": 2,
+            },
+        )
+
+    client = DocumentInsightApi(
+        base_url="http://testserver",
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler), base_url="http://testserver"
+        ),
+    )
+
+    response = client.upload(
+        files=[
+            ("invoice.pdf", b"%PDF-1.4\ninvoice", "application/pdf"),
+            ("contract.pdf", b"%PDF-1.4\ncontract", "application/pdf"),
+        ]
+    )
+
+    assert response["count"] == 2
+    assert len(response["documents"]) == 2
+
+
+def test_get_ingest_status_fetches_document_state() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/ingest/doc_123"
+        return httpx.Response(
+            200,
+            json={
+                "document_id": "doc_123",
+                "file_path": "data/uploads/doc_123_invoice.pdf",
+                "status": "indexed",
+                "message": "indexed and ready for retrieval",
+            },
+        )
+
+    client = DocumentInsightApi(
+        base_url="http://testserver",
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler), base_url="http://testserver"
+        ),
+    )
+
+    response = client.get_ingest_status(document_id="doc_123")
+
+    assert response["document_id"] == "doc_123"
+    assert response["status"] == "indexed"
+
+
 def test_error_envelope_is_normalized_to_api_error() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(

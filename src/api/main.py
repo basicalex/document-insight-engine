@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import logging
+import mimetypes
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -14,9 +17,14 @@ from src.config.settings import Settings, settings
 from src.engine.cloud_agent import CloudAgentEngine, CloudAgentModelClient
 from src.engine.local_llm import LocalQAEngine
 from src.ingestion import (
+    BestEffortParser,
+    BestEffortTextExtractor,
+    HashingIngestionEmbedder,
     HybridVectorIndexStore,
+    IngestionOrchestrator,
     InMemoryIndexBackend,
     IndexingError,
+    ParentChildChunker,
     UploadIntakeError,
     UploadIntakeService,
 )
@@ -27,6 +35,7 @@ from src.models.schemas import (
     IngestResponse,
     IngestionStatus,
     Mode,
+    UploadBatchResponse,
 )
 
 
@@ -67,6 +76,25 @@ class _FallbackCloudModelClient(CloudAgentModelClient):
         }
 
 
+class _DisabledCloudModelClient(CloudAgentModelClient):
+    def next_step(
+        self,
+        *,
+        question: str,
+        mode: Mode,
+        document_id: str,
+        iteration: int,
+        history: list[dict[str, Any]],
+        allowed_tools: list[str],
+    ) -> dict[str, Any]:
+        del question, mode, document_id, iteration, history, allowed_tools
+        return {
+            "action": "final",
+            "answer": "Deep mode is disabled in this deployment.",
+            "insufficient_evidence": True,
+        }
+
+
 @dataclass
 class ApiServices:
     cfg: Settings
@@ -74,7 +102,9 @@ class ApiServices:
     index_store: HybridVectorIndexStore
     local_qa: LocalQAEngine
     cloud_agent: CloudAgentEngine
+    orchestrator: IngestionOrchestrator | None = None
     idempotency_records: dict[str, IngestResponse] = field(default_factory=dict)
+    ingestion_records: dict[str, IngestResponse] = field(default_factory=dict)
     idempotency_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
@@ -98,12 +128,32 @@ def _build_default_services(cfg: Settings) -> ApiServices:
         index_store = HybridVectorIndexStore(cfg=cfg, backend=in_memory)
         index_store.bootstrap_indices()
 
+    extractor = BestEffortTextExtractor()
+    parser = BestEffortParser(fallback_extractor=extractor)
+    chunker = ParentChildChunker()
+    embedder = HashingIngestionEmbedder()
+
+    model_client: CloudAgentModelClient
+    if cfg.cloud_agent_provider == "fallback":
+        model_client = _FallbackCloudModelClient()
+    else:
+        model_client = _DisabledCloudModelClient()
+
     return ApiServices(
         cfg=cfg,
         intake=UploadIntakeService(cfg),
         index_store=index_store,
         local_qa=LocalQAEngine(index_store=index_store, cfg=cfg),
-        cloud_agent=CloudAgentEngine(model_client=_FallbackCloudModelClient(), cfg=cfg),
+        cloud_agent=CloudAgentEngine(model_client=model_client, cfg=cfg),
+        orchestrator=IngestionOrchestrator(
+            extractor=extractor,
+            parser=parser,
+            chunker=chunker,
+            embedder=embedder,
+            index_store=index_store,
+            max_retries_per_stage=2,
+            retry_backoff_seconds=0.0,
+        ),
     )
 
 
@@ -158,8 +208,16 @@ async def validation_error_handler(
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, str]:
-    return {"status": "ok"}
+def healthz(services: ApiServices = Depends(get_services)) -> dict[str, Any]:
+    backend_name = type(services.index_store.backend).__name__
+    return {
+        "status": "ok",
+        "index_backend": backend_name,
+        "orchestrator_configured": services.orchestrator is not None,
+        "deep_mode_enabled": services.cfg.deep_mode_enabled,
+        "cloud_agent_provider": services.cfg.cloud_agent_provider,
+        "dependencies": _runtime_dependency_report(),
+    }
 
 
 @app.post("/ingest", response_model=IngestResponse, status_code=201)
@@ -171,32 +229,121 @@ async def ingest(
 ) -> IngestResponse:
     normalized_key = _normalize_idempotency_key(idempotency_key)
 
+    ingest_response, replayed = await _ingest_upload(
+        upload=file,
+        idempotency_key=normalized_key,
+        services=services,
+    )
+    if replayed:
+        response.status_code = 200
+    return ingest_response
+
+
+@app.get("/ingest/{document_id}", response_model=IngestResponse)
+def get_ingest_status(
+    document_id: str,
+    services: ApiServices = Depends(get_services),
+) -> IngestResponse:
+    record = services.ingestion_records.get(document_id)
+    if record is None:
+        raise ApiError(
+            code="document_not_found",
+            message=f"document not found: {document_id}",
+            status_code=404,
+        )
+    return record
+
+
+@app.post(
+    "/upload",
+    response_model=IngestResponse | UploadBatchResponse,
+    status_code=201,
+)
+async def upload(
+    response: Response,
+    file: UploadFile | None = File(default=None),
+    files: list[UploadFile] | None = File(default=None),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
+    services: ApiServices = Depends(get_services),
+) -> IngestResponse | UploadBatchResponse:
+    normalized_key = _normalize_idempotency_key(idempotency_key)
+    uploads = _normalize_upload_inputs(file=file, files=files)
+    if not uploads:
+        raise ApiError(
+            code="no_files_uploaded",
+            message="at least one file is required",
+            status_code=400,
+        )
+
+    responses: list[IngestResponse] = []
+    replayed_count = 0
+    for index, upload_file in enumerate(uploads, start=1):
+        key = _compose_upload_key(
+            base_key=normalized_key,
+            sequence=index,
+            total_count=len(uploads),
+        )
+        ingest_response, replayed = await _ingest_upload(
+            upload=upload_file,
+            idempotency_key=key,
+            services=services,
+        )
+        responses.append(ingest_response)
+        if replayed:
+            replayed_count += 1
+
+    if len(responses) == 1:
+        if replayed_count == 1:
+            response.status_code = 200
+        return responses[0]
+
+    if replayed_count == len(responses):
+        response.status_code = 200
+    return UploadBatchResponse(documents=responses, count=len(responses))
+
+
+async def _ingest_upload(
+    *,
+    upload: UploadFile,
+    idempotency_key: str | None,
+    services: ApiServices,
+) -> tuple[IngestResponse, bool]:
     try:
-        if normalized_key:
+        if idempotency_key:
             async with services.idempotency_lock:
-                replay = services.idempotency_records.get(normalized_key)
+                replay = services.idempotency_records.get(idempotency_key)
                 if replay is not None:
-                    await file.close()
-                    response.status_code = 200
-                    return replay
+                    await upload.close()
+                    return replay, True
 
                 receipt = await _save_upload_with_timeout(
                     intake=services.intake,
-                    upload=file,
+                    upload=upload,
                     timeout_seconds=services.cfg.ingest_timeout_seconds,
                 )
-                ingest_response = _build_ingest_response(
-                    document_id=receipt.document_id,
-                    file_path=str(receipt.file_path),
+                ingest_response = await _build_ingest_response_for_receipt(
+                    receipt=receipt,
+                    services=services,
+                    mime_type=_normalize_upload_mime(
+                        upload, receipt_file_path=str(receipt.file_path)
+                    ),
                 )
-                services.idempotency_records[normalized_key] = ingest_response
-                return ingest_response
+                services.idempotency_records[idempotency_key] = ingest_response
+                return ingest_response, False
 
         receipt = await _save_upload_with_timeout(
             intake=services.intake,
-            upload=file,
+            upload=upload,
             timeout_seconds=services.cfg.ingest_timeout_seconds,
         )
+        ingest_response = await _build_ingest_response_for_receipt(
+            receipt=receipt,
+            services=services,
+            mime_type=_normalize_upload_mime(
+                upload, receipt_file_path=str(receipt.file_path)
+            ),
+        )
+        return ingest_response, False
     except ApiError:
         raise
     except UploadIntakeError as exc:
@@ -213,10 +360,36 @@ async def ingest(
             details={"error": str(exc)},
         ) from exc
 
-    return _build_ingest_response(
+
+async def _build_ingest_response_for_receipt(
+    *,
+    receipt: Any,
+    services: ApiServices,
+    mime_type: str,
+) -> IngestResponse:
+    if services.orchestrator is None:
+        response = _build_ingest_response(
+            document_id=receipt.document_id,
+            file_path=str(receipt.file_path),
+        )
+        services.ingestion_records[receipt.document_id] = response
+        return response
+
+    record = await _run_orchestration_with_timeout(
+        services=services,
+        document_id=receipt.document_id,
+        file_path=Path(receipt.file_path),
+        mime_type=mime_type,
+    )
+    message = _ingestion_status_message(record.status, record.error_message)
+    response = IngestResponse(
         document_id=receipt.document_id,
         file_path=str(receipt.file_path),
+        status=record.status,
+        message=message,
     )
+    services.ingestion_records[receipt.document_id] = response
+    return response
 
 
 @app.post("/ask", response_model=ChatResponse)
@@ -225,7 +398,16 @@ async def ask(
     services: ApiServices = Depends(get_services),
 ) -> ChatResponse:
     try:
+        _validate_document_ready(document_id=payload.document_id, services=services)
+
         if payload.mode == Mode.DEEP:
+            if not services.cfg.deep_mode_enabled:
+                raise ApiError(
+                    code="deep_mode_disabled",
+                    message="deep mode is disabled in this deployment",
+                    status_code=503,
+                    details={"cloud_agent_provider": services.cfg.cloud_agent_provider},
+                )
             return await _ask_with_timeout(
                 handler=lambda: services.cloud_agent.ask(
                     question=payload.question,
@@ -296,6 +478,46 @@ async def _save_upload_with_timeout(
         ) from exc
 
 
+async def _run_orchestration_with_timeout(
+    *,
+    services: ApiServices,
+    document_id: str,
+    file_path: Path,
+    mime_type: str,
+) -> Any:
+    orchestrator = services.orchestrator
+    if orchestrator is None:
+        raise ApiError(
+            code="orchestrator_unavailable",
+            message="ingestion orchestrator is not configured",
+            status_code=503,
+        )
+
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                orchestrator.process,
+                document_id,
+                file_path,
+                mime_type,
+            ),
+            timeout=services.cfg.ingest_timeout_seconds,
+        )
+    except asyncio.TimeoutError as exc:
+        raise ApiError(
+            code="ingest_pipeline_timeout",
+            message="ingestion pipeline timed out",
+            status_code=504,
+        ) from exc
+    except Exception as exc:
+        raise ApiError(
+            code="ingest_pipeline_failed",
+            message="ingestion pipeline failed unexpectedly",
+            status_code=500,
+            details={"error": str(exc)},
+        ) from exc
+
+
 async def _ask_with_timeout(*, handler: Any, timeout_seconds: int) -> ChatResponse:
     try:
         return await asyncio.wait_for(
@@ -330,3 +552,85 @@ def _build_error_response(
     if correlation_id:
         response.headers["x-correlation-id"] = correlation_id
     return response
+
+
+def _normalize_upload_inputs(
+    *,
+    file: UploadFile | None,
+    files: list[UploadFile] | None,
+) -> list[UploadFile]:
+    uploads: list[UploadFile] = []
+    if file is not None:
+        uploads.append(file)
+    if files:
+        uploads.extend(files)
+    return uploads
+
+
+def _compose_upload_key(
+    *,
+    base_key: str | None,
+    sequence: int,
+    total_count: int,
+) -> str | None:
+    if not base_key:
+        return None
+    if total_count == 1:
+        return base_key
+    return f"{base_key}:{sequence}"
+
+
+def _normalize_upload_mime(upload: UploadFile, receipt_file_path: str) -> str:
+    if upload.content_type:
+        return upload.content_type
+    guessed = mimetypes.guess_type(receipt_file_path)[0]
+    return guessed or "application/octet-stream"
+
+
+def _ingestion_status_message(
+    status: IngestionStatus, error_message: str | None
+) -> str:
+    if status == IngestionStatus.INDEXED:
+        return "indexed and ready for retrieval"
+    if status == IngestionStatus.PARTIAL:
+        return error_message or "partially indexed; some stages failed"
+    if status == IngestionStatus.FAILED:
+        return error_message or "ingestion failed"
+    if status == IngestionStatus.PROCESSING:
+        return "ingestion is processing"
+    return "queued for processing"
+
+
+def _validate_document_ready(*, document_id: str | None, services: ApiServices) -> None:
+    if not document_id:
+        return
+    if services.orchestrator is None:
+        return
+
+    ingest = services.ingestion_records.get(document_id)
+    if ingest is None:
+        return
+
+    if ingest.status == IngestionStatus.INDEXED:
+        return
+
+    raise ApiError(
+        code="document_not_ready",
+        message=f"document status is {ingest.status.value}; ready status is indexed",
+        status_code=409,
+        details={"document_id": document_id, "status": ingest.status.value},
+    )
+
+
+def _runtime_dependency_report() -> dict[str, bool]:
+    modules = {
+        "redisvl": "redisvl",
+        "pymupdf": "pymupdf",
+        "pillow": "PIL",
+        "pytesseract": "pytesseract",
+        "docling": "docling",
+    }
+    return {
+        label: importlib.util.find_spec(module_name) is not None
+        for label, module_name in modules.items()
+    }

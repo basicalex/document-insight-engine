@@ -39,6 +39,12 @@ from src.ingestion.orchestration import (
     RetryableStageError,
 )
 from src.ingestion.uploads import UploadIntakeError, UploadIntakeService
+from src.ingestion.runtime_pipeline import (
+    BestEffortParser,
+    BestEffortTextExtractor,
+    HashingIngestionEmbedder,
+)
+from src.ingestion.vectorize import hashing_vector, tokenize_words
 
 __all__ = [
     "ChildChunk",
@@ -72,4 +78,9 @@ __all__ = [
     "PipelineError",
     "UploadIntakeError",
     "UploadIntakeService",
+    "BestEffortParser",
+    "BestEffortTextExtractor",
+    "HashingIngestionEmbedder",
+    "hashing_vector",
+    "tokenize_words",
 ]

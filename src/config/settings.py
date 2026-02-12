@@ -50,6 +50,9 @@ class Settings(BaseSettings):
     local_embedding_model: str = "all-MiniLM-L6-v2"
     cloud_embedding_model: str = "gemini-embedding-001"
 
+    deep_mode_enabled: bool = False
+    cloud_agent_provider: Literal["disabled", "fallback"] = "disabled"
+
     max_upload_size_mb: PositiveInt = 50
     request_timeout_seconds: PositiveInt = 60
     ingest_timeout_seconds: PositiveInt = 120
@@ -74,6 +77,10 @@ class Settings(BaseSettings):
         if self.request_timeout_seconds > self.ingest_timeout_seconds:
             raise ValueError(
                 "request_timeout_seconds cannot exceed ingest_timeout_seconds"
+            )
+        if self.deep_mode_enabled and self.cloud_agent_provider == "disabled":
+            raise ValueError(
+                "cloud_agent_provider cannot be disabled when deep_mode_enabled is true"
             )
         return self
 

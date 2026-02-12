@@ -64,55 +64,86 @@ def _render_sidebar() -> None:
     )
     st.session_state["session_id"] = session_id_value.strip()
 
-    uploaded_file = st.sidebar.file_uploader(
-        "Upload a file",
+    uploaded_files = st.sidebar.file_uploader(
+        "Upload file(s)",
         type=["pdf", "png", "jpg", "jpeg", "tiff"],
+        accept_multiple_files=True,
     )
     if st.sidebar.button(
-        "Ingest", use_container_width=True, disabled=uploaded_file is None
+        "Upload + Ingest", use_container_width=True, disabled=not uploaded_files
     ):
-        _handle_ingest(uploaded_file)
+        _handle_upload(uploaded_files)
+
+    if st.session_state["active_document_id"] and st.sidebar.button(
+        "Refresh status", use_container_width=True
+    ):
+        _refresh_ingest_status(st.session_state["active_document_id"])
 
     if st.sidebar.button("Clear chat", use_container_width=True):
         clear_chat(st.session_state)
 
 
 def _render_status_bar() -> None:
-    status_cols = st.columns(3)
+    status_cols = st.columns(4)
     status_cols[0].metric("Mode", st.session_state["chat_mode"])
 
     active_document = st.session_state["active_document_id"] or "none"
     status_cols[1].metric("Document", active_document)
 
     status_cols[2].metric("Turns", str(len(st.session_state["messages"])))
+    latest_status = (
+        st.session_state["ingest_history"][-1]["status"]
+        if st.session_state["ingest_history"]
+        else "n/a"
+    )
+    status_cols[3].metric("Ingest status", latest_status)
 
 
-def _handle_ingest(uploaded_file: Any) -> None:
-    if uploaded_file is None:
+def _handle_upload(uploaded_files: list[Any]) -> None:
+    if not uploaded_files:
         return
 
-    content_type = uploaded_file.type or mimetypes.guess_type(uploaded_file.name)[0]
-    if not content_type:
-        content_type = "application/octet-stream"
+    files: list[tuple[str, bytes, str]] = []
+    for uploaded_file in uploaded_files:
+        content_type = uploaded_file.type or mimetypes.guess_type(uploaded_file.name)[0]
+        if not content_type:
+            content_type = "application/octet-stream"
+        files.append((uploaded_file.name, uploaded_file.getvalue(), content_type))
 
     with st.sidebar:
-        with st.spinner("Ingesting document..."):
+        with st.spinner("Uploading and ingesting..."):
             try:
                 with DocumentInsightApi(
                     base_url=st.session_state["api_base_url"]
                 ) as api:
-                    response = api.ingest(
-                        file_name=uploaded_file.name,
-                        content=uploaded_file.getvalue(),
-                        content_type=content_type,
-                    )
+                    response = api.upload(files=files)
             except ApiError as exc:
                 st.error(_format_api_error(exc))
                 return
 
-    document_id = str(response.get("document_id", "")).strip()
-    if document_id:
-        st.session_state["active_document_id"] = document_id
+    records = _normalize_upload_response(response)
+    for item in records:
+        st.session_state["ingest_history"].append(item)
+
+    if records:
+        latest = records[-1]
+        document_id = str(latest.get("document_id", "")).strip()
+        if document_id:
+            st.session_state["active_document_id"] = document_id
+        st.sidebar.success(f"Ingested {len(records)} document(s)")
+
+
+def _refresh_ingest_status(document_id: str) -> None:
+    with st.sidebar:
+        with st.spinner("Refreshing ingestion status..."):
+            try:
+                with DocumentInsightApi(
+                    base_url=st.session_state["api_base_url"]
+                ) as api:
+                    response = api.get_ingest_status(document_id=document_id)
+            except ApiError as exc:
+                st.error(_format_api_error(exc))
+                return
 
     st.session_state["ingest_history"].append(
         {
@@ -122,10 +153,13 @@ def _handle_ingest(uploaded_file: Any) -> None:
             "file_path": response.get("file_path"),
         }
     )
-    st.sidebar.success(f"Ingested document: {document_id}")
 
 
 def _render_chat_history() -> None:
+    if st.session_state["ingest_history"]:
+        with st.expander("Recent ingest events", expanded=False):
+            st.json(st.session_state["ingest_history"][-5:])
+
     for message in st.session_state["messages"]:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
@@ -208,6 +242,33 @@ def _format_api_error(error: ApiError) -> str:
             f"status={error.status_code}, correlation_id={error.correlation_id})"
         )
     return f"{error.message} (code={error.code}, status={error.status_code})"
+
+
+def _normalize_upload_response(response: dict[str, Any]) -> list[dict[str, Any]]:
+    documents = response.get("documents")
+    if isinstance(documents, list):
+        normalized: list[dict[str, Any]] = []
+        for item in documents:
+            if not isinstance(item, dict):
+                continue
+            normalized.append(
+                {
+                    "document_id": item.get("document_id"),
+                    "status": item.get("status"),
+                    "message": item.get("message"),
+                    "file_path": item.get("file_path"),
+                }
+            )
+        return normalized
+
+    return [
+        {
+            "document_id": response.get("document_id"),
+            "status": response.get("status"),
+            "message": response.get("message"),
+            "file_path": response.get("file_path"),
+        }
+    ]
 
 
 if __name__ == "__main__":

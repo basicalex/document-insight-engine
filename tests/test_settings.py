@@ -39,3 +39,13 @@ def test_settings_ensure_runtime_dirs(tmp_path: Path) -> None:
     assert (tmp_path / "uploads").exists()
     assert (tmp_path / "parsed").exists()
     assert (tmp_path / "traces").exists()
+
+
+def test_settings_rejects_enabled_deep_mode_with_disabled_provider() -> None:
+    with pytest.raises(ValidationError):
+        Settings(deep_mode_enabled=True, cloud_agent_provider="disabled")
+
+
+def test_settings_accepts_enabled_deep_mode_with_fallback_provider() -> None:
+    cfg = Settings(deep_mode_enabled=True, cloud_agent_provider="fallback")
+    assert cfg.deep_mode_enabled is True

@@ -103,6 +103,8 @@ def _build_services(
         max_upload_size_mb=2,
         request_timeout_seconds=5,
         ingest_timeout_seconds=10,
+        deep_mode_enabled=True,
+        cloud_agent_provider="fallback",
     )
     index_store = HybridVectorIndexStore(
         cfg=cfg,

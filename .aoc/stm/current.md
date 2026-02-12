@@ -1,1 +1,5 @@
 - [2026-02-12 11:58] Task 15 complete: phase validation suite added in tests/test_phase_validation.py with latency/reliability/safety assertions and extraction accuracy grounding. Full pytest passes (67/67).
+- [2026-02-12 12:52] Task 17 in progress: subtasks 1-2 done. Implemented orchestrated ingest pipeline and /upload alias; added runtime_pipeline + vectorize modules, deterministic hashing in local query embedder, and API tests for pipeline wiring/upload batch. Full pytest currently passing (70).
+- [2026-02-12 12:57] Task 17 progress: subtasks 1-3 done. Added /ingest/{document_id} status endpoint and ask readiness gate tied to ingestion_records.
+- [2026-02-12 13:00] Task 17 status: subtasks 1,2,3,6,7,8 done; remaining 4 (deep-mode provider wiring) and 5 (dependency readiness hardening). Full pytest passing (78).
+- [2026-02-12 13:05] Task 17 complete: all subtasks done. System now has orchestrated ingest path, assignment upload parity, status lookup, frontend status UX, deep-mode capability gating, health dependency diagnostics, and dependency hardening. pytest 81/81 passing.

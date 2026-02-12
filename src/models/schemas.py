@@ -87,6 +87,11 @@ class IngestResponse(BaseModel):
     message: str | None = None
 
 
+class UploadBatchResponse(BaseModel):
+    documents: list[IngestResponse] = Field(default_factory=list)
+    count: int = Field(ge=0)
+
+
 class ErrorEnvelope(BaseModel):
     model_config = ConfigDict(extra="allow")
 

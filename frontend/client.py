@@ -80,6 +80,48 @@ class DocumentInsightApi:
 
         return _decode_response(response)
 
+    def upload(
+        self,
+        *,
+        files: list[tuple[str, bytes, str]],
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
+        headers: dict[str, str] = {}
+        if idempotency_key:
+            headers["Idempotency-Key"] = idempotency_key
+
+        multipart_files = [
+            ("files", (file_name, content, content_type))
+            for file_name, content, content_type in files
+        ]
+        try:
+            response = self._client.post(
+                "/upload",
+                files=multipart_files,
+                headers=headers,
+            )
+        except httpx.HTTPError as exc:
+            raise ApiError(
+                status_code=0,
+                code="network_error",
+                message="unable to reach API service",
+                details={"error": str(exc)},
+            ) from exc
+
+        return _decode_response(response)
+
+    def get_ingest_status(self, *, document_id: str) -> dict[str, Any]:
+        try:
+            response = self._client.get(f"/ingest/{document_id}")
+        except httpx.HTTPError as exc:
+            raise ApiError(
+                status_code=0,
+                code="network_error",
+                message="unable to reach API service",
+                details={"error": str(exc)},
+            ) from exc
+        return _decode_response(response)
+
     def ask(
         self,
         *,
