@@ -11,7 +11,12 @@ This repository is being built for the following core assignment goals:
 - Dockerized deployment.
 - Repository-committed dummy docs for testing.
 
-Current state: foundation and infrastructure are implemented; `/upload` and `/ask` are next.
+Current state:
+
+- Foundation + infrastructure are implemented.
+- Ingestion pipeline is implemented (`/ingest` currently available).
+- Engine internals for local QA, agent loop guard, and Tier 4 extraction are implemented.
+- API contract finalization for `/ask` and `/upload` aliasing is next.
 
 ## Included dummy test docs (committed)
 
@@ -50,7 +55,19 @@ Services started by compose:
 - `redis` (persistent volume)
 - `ollama` (model cache mounted under `./models`)
 
-## API examples (target contracts)
+## API status and target contracts
+
+Current API endpoints:
+
+- `GET /healthz`
+- `POST /ingest`
+
+Planned/next API endpoints:
+
+- `POST /ask`
+- `POST /upload` (alias/contract alignment)
+
+Target contract examples:
 
 Upload request (planned):
 
@@ -108,3 +125,10 @@ Expected ask response shape:
 - **Extraction**: PyMuPDF first, OCR fallback path for scanned/image-like docs.
 - **QA/RAG**: Local QA baseline + optional deeper retrieval/agentic path.
 - **Infra**: Docker Compose with Redis + Ollama + API, with persistence and limits.
+
+## Engine components (implemented)
+
+- `src/engine/local_llm.py`: grounded local QA flow with retrieval-first prompting, insufficient-evidence fallback, and trace metadata.
+- `src/engine/cloud_agent.py`: strict tool-allowlisted agent orchestration (`list_sections`, `read_section`, `keyword_grep`) with hard 5-iteration guard.
+- `src/engine/extractor.py`: Tier 4 structured extraction adapter with schema validation, per-field provenance offset checks, and token-budget preflight guards.
+- `src/tools/fs_tools.py`: deterministic markdown filesystem tools used by agent reasoning.
