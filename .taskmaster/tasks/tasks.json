@@ -1,170 +1,4 @@
 {
-  "api-ui": {
-    "tasks": [
-      {
-        "id": "13",
-        "title": "Deliver API contracts for /ingest and /ask with validation guardrails",
-        "description": "Expose core backend capabilities through stable, testable FastAPI endpoints.",
-        "details": "Implement POST /ingest and POST /ask request/response contracts, mode-aware routing, correlation IDs, timeout/error mapping, and retry-safe semantics. Ensure ask responses include grounding/citation-ready fields.",
-        "testStrategy": "Integration tests for happy paths, malformed payload handling, idempotent ingest behavior, and mode routing correctness.",
-        "status": "pending",
-        "dependencies": [
-          "8",
-          "9",
-          "11",
-          "12"
-        ],
-        "priority": "high",
-        "subtasks": [
-          {
-            "id": 1,
-            "title": "Define /ingest and /ask request/response contracts",
-            "description": "Finalize Pydantic schemas for payloads, response envelopes, grounding fields, and correlation ID propagation.",
-            "status": "pending",
-            "dependencies": []
-          },
-          {
-            "id": 2,
-            "title": "Implement POST /ingest endpoint with retry-safe semantics",
-            "description": "Wire endpoint to ingestion orchestration, enforce validation bounds, and return deterministic status/error mapping for retries.",
-            "status": "pending",
-            "dependencies": [
-              "1"
-            ]
-          },
-          {
-            "id": 3,
-            "title": "Implement POST /ask endpoint with mode-aware routing",
-            "description": "Route fast/deep modes to local QA or agent/extraction pipelines and enforce grounding/citation-ready response fields.",
-            "status": "pending",
-            "dependencies": [
-              "1"
-            ]
-          },
-          {
-            "id": 4,
-            "title": "Add API guardrails for timeout, error normalization, and idempotency",
-            "description": "Centralize exception mapping, timeout handling, and idempotency behavior to prevent duplicate side effects and ambiguous failures.",
-            "status": "pending",
-            "dependencies": [
-              "2",
-              "3"
-            ]
-          },
-          {
-            "id": 5,
-            "title": "Create integration tests for contracts and malformed payloads",
-            "description": "Cover happy paths, malformed requests, idempotent ingest retries, and mode routing correctness across /ingest and /ask.",
-            "status": "pending",
-            "dependencies": [
-              "2",
-              "3",
-              "4"
-            ]
-          }
-        ],
-        "aocPrd": {
-          "path": ".taskmaster/docs/prd.txt",
-          "updatedAt": "2026-02-11T11:13:06.532Z",
-          "version": 1
-        },
-        "updatedAt": "2026-02-11T11:16:10.206Z",
-        "activeAgent": false
-      },
-      {
-        "id": "14",
-        "title": "Build Streamlit chat interface with mode toggle and trace viewer",
-        "description": "Provide user-facing interaction for ingestion and Q&A with transparent reasoning traces.",
-        "details": "Implement frontend/app.py chat flow, mode selector, session state, ingest action wiring, and expandable trace display. Keep UI simple and aligned with PRD scope constraints.",
-        "testStrategy": "UI-level tests for mode switching and session state; mocked API integration smoke tests for core flows.",
-        "status": "pending",
-        "dependencies": [
-          "13"
-        ],
-        "priority": "medium",
-        "subtasks": [],
-        "aocPrd": {
-          "path": ".taskmaster/docs/prd.txt",
-          "updatedAt": "2026-02-11T11:13:06.539Z",
-          "version": 1
-        },
-        "updatedAt": "2026-02-11T11:13:06.539Z",
-        "activeAgent": false
-      }
-    ]
-  },
-  "qa": {
-    "tasks": [
-      {
-        "id": "15",
-        "title": "Implement phase validation suite for latency and reliability goals",
-        "description": "Verify API behavior, restart persistence, and key safety metrics against PRD targets.",
-        "details": "Create tests/test_api.py and tests/data fixtures covering ingest-to-ask workflows, restart persistence checks, loop guard verification, Tier 1 latency instrumentation thresholds (<2s), and Tier 4 extraction quality checks (>98% with character-level grounding). Include CI-friendly reporting for regressions.",
-        "testStrategy": "Run unit/integration/E2E smoke tests with explicit pyramid targets (about 60/30/10), plus metric assertions for latency, extraction accuracy, loop cap enforcement, and restart data retention.",
-        "status": "pending",
-        "dependencies": [
-          "13",
-          "14"
-        ],
-        "priority": "high",
-        "subtasks": [
-          {
-            "id": 1,
-            "title": "Create phase test matrix and fixture inventory",
-            "description": "Define coverage matrix for ingest-to-ask flows, restart persistence, loop guard, latency checks, and extraction-accuracy grounding checks; map required fixtures under tests/data while targeting a 60/30/10 unit/integration/E2E split.",
-            "status": "pending",
-            "dependencies": []
-          },
-          {
-            "id": 2,
-            "title": "Implement API integration tests in tests/test_api.py",
-            "description": "Add end-to-end API flow coverage for ingest and ask across fast/deep modes with deterministic assertions.",
-            "status": "pending",
-            "dependencies": [
-              "1"
-            ]
-          },
-          {
-            "id": 3,
-            "title": "Add restart persistence verification tests",
-            "description": "Simulate service restart cycles and assert previously ingested document data remains queryable with no record loss.",
-            "status": "pending",
-            "dependencies": [
-              "1",
-              "2"
-            ]
-          },
-          {
-            "id": 4,
-            "title": "Add loop-guard and safety regression tests",
-            "description": "Assert Tier 3 orchestration enforces 5-iteration cap and surfaces expected termination diagnostics.",
-            "status": "pending",
-            "dependencies": [
-              "2"
-            ]
-          },
-          {
-            "id": 5,
-            "title": "Instrument latency checks and CI-friendly reporting",
-            "description": "Capture Tier 1 latency metrics with pass/fail thresholds and generate machine-readable test reports for regression tracking.",
-            "status": "pending",
-            "dependencies": [
-              "2",
-              "3",
-              "4"
-            ]
-          }
-        ],
-        "aocPrd": {
-          "path": ".taskmaster/docs/prd.txt",
-          "updatedAt": "2026-02-11T11:13:06.546Z",
-          "version": 1
-        },
-        "updatedAt": "2026-02-11T11:17:59.490Z",
-        "activeAgent": false
-      }
-    ]
-  },
   "engine": {
     "tasks": [
       {
@@ -173,7 +7,7 @@
         "description": "Provide Tier 1 and Tier 2 answering via Ollama with strict context-grounding behavior.",
         "details": "Implement local_llm flow with retrieval-aware prompts, evidence-first answer policy, and explicit insufficient-evidence fallback. Capture trace fields for prompt version, retrieved chunk IDs, and latency metrics.",
         "testStrategy": "Unit-test prompt assembly and fallback behavior; integration-test response schema and grounding fields with mocked Ollama when needed.",
-        "status": "pending",
+        "status": "done",
         "dependencies": [
           "7",
           "8"
@@ -185,7 +19,7 @@
           "updatedAt": "2026-02-11T11:13:06.502Z",
           "version": 1
         },
-        "updatedAt": "2026-02-11T11:13:06.502Z",
+        "updatedAt": "2026-02-12T09:47:11.390Z",
         "activeAgent": false
       },
       {
@@ -194,7 +28,7 @@
         "description": "Expose list_sections, read_section, and keyword_grep tools over parsed markdown sources.",
         "details": "Implement deterministic tool contracts with normalized section keys, bounded outputs, and source offsets/line spans. Return structured tool errors for missing sections and no-match grep cases.",
         "testStrategy": "Unit-test each tool on representative markdown fixtures, including negative-path error scenarios.",
-        "status": "pending",
+        "status": "done",
         "dependencies": [
           "5"
         ],
@@ -205,7 +39,7 @@
           "updatedAt": "2026-02-11T11:13:06.510Z",
           "version": 1
         },
-        "updatedAt": "2026-02-11T11:13:06.510Z",
+        "updatedAt": "2026-02-12T09:44:57.566Z",
         "activeAgent": false
       },
       {
@@ -351,6 +185,120 @@
           "version": 1
         },
         "updatedAt": "2026-02-11T11:17:59.473Z",
+        "activeAgent": false
+      }
+    ]
+  },
+  "qa": {
+    "tasks": [
+      {
+        "id": "15",
+        "title": "Implement phase validation suite for latency and reliability goals",
+        "description": "Verify API behavior, restart persistence, and key safety metrics against PRD targets.",
+        "details": "Create tests/test_api.py and tests/data fixtures covering ingest-to-ask workflows, restart persistence checks, loop guard verification, Tier 1 latency instrumentation thresholds (<2s), and Tier 4 extraction quality checks (>98% with character-level grounding). Include CI-friendly reporting for regressions.",
+        "testStrategy": "Run unit/integration/E2E smoke tests with explicit pyramid targets (about 60/30/10), plus metric assertions for latency, extraction accuracy, loop cap enforcement, and restart data retention.",
+        "status": "pending",
+        "dependencies": [
+          "13",
+          "14"
+        ],
+        "priority": "high",
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "Create phase test matrix and fixture inventory",
+            "description": "Define coverage matrix for ingest-to-ask flows, restart persistence, loop guard, latency checks, and extraction-accuracy grounding checks; map required fixtures under tests/data while targeting a 60/30/10 unit/integration/E2E split.",
+            "status": "pending",
+            "dependencies": []
+          },
+          {
+            "id": 2,
+            "title": "Implement API integration tests in tests/test_api.py",
+            "description": "Add end-to-end API flow coverage for ingest and ask across fast/deep modes with deterministic assertions.",
+            "status": "pending",
+            "dependencies": [
+              "1"
+            ]
+          },
+          {
+            "id": 3,
+            "title": "Add restart persistence verification tests",
+            "description": "Simulate service restart cycles and assert previously ingested document data remains queryable with no record loss.",
+            "status": "pending",
+            "dependencies": [
+              "1",
+              "2"
+            ]
+          },
+          {
+            "id": 4,
+            "title": "Add loop-guard and safety regression tests",
+            "description": "Assert Tier 3 orchestration enforces 5-iteration cap and surfaces expected termination diagnostics.",
+            "status": "pending",
+            "dependencies": [
+              "2"
+            ]
+          },
+          {
+            "id": 5,
+            "title": "Instrument latency checks and CI-friendly reporting",
+            "description": "Capture Tier 1 latency metrics with pass/fail thresholds and generate machine-readable test reports for regression tracking.",
+            "status": "pending",
+            "dependencies": [
+              "2",
+              "3",
+              "4"
+            ]
+          }
+        ],
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-11T11:13:06.546Z",
+          "version": 1
+        },
+        "updatedAt": "2026-02-11T11:17:59.490Z",
+        "activeAgent": false
+      }
+    ]
+  },
+  "infra": {
+    "tasks": [
+      {
+        "id": "1",
+        "title": "Establish runtime settings and shared data schemas",
+        "description": "Create the foundational configuration and Pydantic schema layer used by all modules.",
+        "details": "Implement src/config/settings.py for env loading and validation, plus src/models/schemas.py for core request/response, document, and trace-compatible models. Fail fast on invalid env values and centralize constants for paths, model names, and service endpoints.",
+        "testStrategy": "Unit-test env parsing/overrides and schema validation/serialization, including invalid payload cases.",
+        "status": "done",
+        "dependencies": [],
+        "priority": "high",
+        "subtasks": [],
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-11T11:13:06.410Z",
+          "version": 1
+        },
+        "updatedAt": "2026-02-11T12:25:28.010Z",
+        "activeAgent": false
+      },
+      {
+        "id": "2",
+        "title": "Compose local infrastructure with persistence and resource limits",
+        "description": "Stand up Redis, Ollama, and API services with restart-safe storage and operational guardrails.",
+        "details": "Create docker-compose services, health checks, and mounts for ./data, ./models, and Redis persistence. Add explicit memory constraints and restart policies to mitigate OOM risk while preserving data across restarts.",
+        "testStrategy": "Run docker compose smoke tests, restart-cycle persistence checks, and controlled memory stress checks.",
+        "status": "done",
+        "dependencies": [
+          "1"
+        ],
+        "priority": "high",
+        "subtasks": [],
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-11T11:13:06.428Z",
+          "version": 1
+        },
+        "updatedAt": "2026-02-11T12:25:28.021Z",
         "activeAgent": false
       }
     ]
@@ -546,44 +494,96 @@
       }
     ]
   },
-  "infra": {
+  "api-ui": {
     "tasks": [
       {
-        "id": "1",
-        "title": "Establish runtime settings and shared data schemas",
-        "description": "Create the foundational configuration and Pydantic schema layer used by all modules.",
-        "details": "Implement src/config/settings.py for env loading and validation, plus src/models/schemas.py for core request/response, document, and trace-compatible models. Fail fast on invalid env values and centralize constants for paths, model names, and service endpoints.",
-        "testStrategy": "Unit-test env parsing/overrides and schema validation/serialization, including invalid payload cases.",
-        "status": "done",
-        "dependencies": [],
+        "id": "13",
+        "title": "Deliver API contracts for /ingest and /ask with validation guardrails",
+        "description": "Expose core backend capabilities through stable, testable FastAPI endpoints.",
+        "details": "Implement POST /ingest and POST /ask request/response contracts, mode-aware routing, correlation IDs, timeout/error mapping, and retry-safe semantics. Ensure ask responses include grounding/citation-ready fields.",
+        "testStrategy": "Integration tests for happy paths, malformed payload handling, idempotent ingest behavior, and mode routing correctness.",
+        "status": "pending",
+        "dependencies": [
+          "8",
+          "9",
+          "11",
+          "12"
+        ],
         "priority": "high",
-        "subtasks": [],
+        "subtasks": [
+          {
+            "id": 1,
+            "title": "Define /ingest and /ask request/response contracts",
+            "description": "Finalize Pydantic schemas for payloads, response envelopes, grounding fields, and correlation ID propagation.",
+            "status": "pending",
+            "dependencies": []
+          },
+          {
+            "id": 2,
+            "title": "Implement POST /ingest endpoint with retry-safe semantics",
+            "description": "Wire endpoint to ingestion orchestration, enforce validation bounds, and return deterministic status/error mapping for retries.",
+            "status": "pending",
+            "dependencies": [
+              "1"
+            ]
+          },
+          {
+            "id": 3,
+            "title": "Implement POST /ask endpoint with mode-aware routing",
+            "description": "Route fast/deep modes to local QA or agent/extraction pipelines and enforce grounding/citation-ready response fields.",
+            "status": "pending",
+            "dependencies": [
+              "1"
+            ]
+          },
+          {
+            "id": 4,
+            "title": "Add API guardrails for timeout, error normalization, and idempotency",
+            "description": "Centralize exception mapping, timeout handling, and idempotency behavior to prevent duplicate side effects and ambiguous failures.",
+            "status": "pending",
+            "dependencies": [
+              "2",
+              "3"
+            ]
+          },
+          {
+            "id": 5,
+            "title": "Create integration tests for contracts and malformed payloads",
+            "description": "Cover happy paths, malformed requests, idempotent ingest retries, and mode routing correctness across /ingest and /ask.",
+            "status": "pending",
+            "dependencies": [
+              "2",
+              "3",
+              "4"
+            ]
+          }
+        ],
         "aocPrd": {
           "path": ".taskmaster/docs/prd.txt",
-          "updatedAt": "2026-02-11T11:13:06.410Z",
+          "updatedAt": "2026-02-11T11:13:06.532Z",
           "version": 1
         },
-        "updatedAt": "2026-02-11T12:25:28.010Z",
+        "updatedAt": "2026-02-11T11:16:10.206Z",
         "activeAgent": false
       },
       {
-        "id": "2",
-        "title": "Compose local infrastructure with persistence and resource limits",
-        "description": "Stand up Redis, Ollama, and API services with restart-safe storage and operational guardrails.",
-        "details": "Create docker-compose services, health checks, and mounts for ./data, ./models, and Redis persistence. Add explicit memory constraints and restart policies to mitigate OOM risk while preserving data across restarts.",
-        "testStrategy": "Run docker compose smoke tests, restart-cycle persistence checks, and controlled memory stress checks.",
-        "status": "done",
+        "id": "14",
+        "title": "Build Streamlit chat interface with mode toggle and trace viewer",
+        "description": "Provide user-facing interaction for ingestion and Q&A with transparent reasoning traces.",
+        "details": "Implement frontend/app.py chat flow, mode selector, session state, ingest action wiring, and expandable trace display. Keep UI simple and aligned with PRD scope constraints.",
+        "testStrategy": "UI-level tests for mode switching and session state; mocked API integration smoke tests for core flows.",
+        "status": "pending",
         "dependencies": [
-          "1"
+          "13"
         ],
-        "priority": "high",
+        "priority": "medium",
         "subtasks": [],
         "aocPrd": {
           "path": ".taskmaster/docs/prd.txt",
-          "updatedAt": "2026-02-11T11:13:06.428Z",
+          "updatedAt": "2026-02-11T11:13:06.539Z",
           "version": 1
         },
-        "updatedAt": "2026-02-11T12:25:28.021Z",
+        "updatedAt": "2026-02-11T11:13:06.539Z",
         "activeAgent": false
       }
     ]
