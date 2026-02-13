@@ -266,7 +266,7 @@ def _build_tier4_provider_client(cfg: Settings) -> TextEmbeddingClient:
     if cfg.cloud_embedding_provider == "ollama":
         return OllamaEmbeddingClient(
             base_url=cfg.ollama_base_url,
-            model=cfg.local_embedding_model,
+            model=cfg.cloud_embedding_model,
             dimension=cfg.cloud_embedding_dimension,
             timeout_seconds=cfg.embedding_timeout_seconds,
         )
