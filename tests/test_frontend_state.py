@@ -6,6 +6,7 @@ import pytest
 
 from frontend.state import (
     DEFAULT_API_BASE_URL,
+    DEFAULT_EXTRACTION_SCHEMA,
     append_assistant_message,
     append_user_message,
     clear_chat,
@@ -25,6 +26,12 @@ def test_initialize_session_state_sets_expected_defaults() -> None:
     assert state["session_id"] == ""
     assert state["messages"] == []
     assert state["ingest_history"] == []
+    assert state["runtime_health"] == {}
+    assert state["metrics_text"] == ""
+    assert state["runtime_bootstrapped"] is False
+    assert state["extract_schema_text"] == DEFAULT_EXTRACTION_SCHEMA
+    assert state["extract_prompt"]
+    assert state["last_extract_result"] is None
 
 
 def test_initialize_session_state_preserves_existing_values() -> None:

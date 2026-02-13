@@ -16,6 +16,8 @@ def test_compose_includes_core_services() -> None:
     assert 'DOCLING_ENABLED: "true"' in compose
     assert 'GOOGLE_PARSER_ENABLED: "true"' in compose
     assert 'LANGEXTRACT_ENABLED: "true"' in compose
+    assert 'DEEP_MODE_ENABLED: "true"' in compose
+    assert "CLOUD_AGENT_PROVIDER: local" in compose
 
 
 def test_dev_compose_enables_reload_and_bind_mounts() -> None:
@@ -27,6 +29,8 @@ def test_dev_compose_enables_reload_and_bind_mounts() -> None:
     assert "./src:/app/src" in compose
     assert "./frontend:/app/frontend" in compose
     assert "--server.fileWatcherType=poll" in compose
+    assert 'DEEP_MODE_ENABLED: "true"' in compose
+    assert "CLOUD_AGENT_PROVIDER: local" in compose
 
 
 def test_dockerfile_installs_optional_ai_dependencies() -> None:

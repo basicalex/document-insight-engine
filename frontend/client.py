@@ -187,6 +187,61 @@ class DocumentInsightApi:
                 details={"error": str(exc)},
             ) from exc
 
+    def extract(
+        self,
+        *,
+        document_id: str,
+        extraction_schema: dict[str, Any],
+        prompt: str | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "document_id": document_id,
+            "schema": extraction_schema,
+        }
+        if prompt is not None and prompt.strip():
+            payload["prompt"] = prompt.strip()
+
+        try:
+            response = self._client.post("/extract", json=payload)
+        except httpx.HTTPError as exc:
+            raise ApiError(
+                status_code=0,
+                code="network_error",
+                message="unable to reach API service",
+                details={"error": str(exc)},
+            ) from exc
+
+        return _decode_response(response)
+
+    def healthz(self) -> dict[str, Any]:
+        try:
+            response = self._client.get("/healthz")
+        except httpx.HTTPError as exc:
+            raise ApiError(
+                status_code=0,
+                code="network_error",
+                message="unable to reach API service",
+                details={"error": str(exc)},
+            ) from exc
+
+        return _decode_response(response)
+
+    def metrics(self) -> str:
+        try:
+            response = self._client.get("/metrics")
+        except httpx.HTTPError as exc:
+            raise ApiError(
+                status_code=0,
+                code="network_error",
+                message="unable to reach API service",
+                details={"error": str(exc)},
+            ) from exc
+
+        if response.is_error:
+            payload = _safe_json(response)
+            raise _build_api_error(response=response, payload=payload)
+        return response.text
+
 
 def _decode_response(response: httpx.Response) -> dict[str, Any]:
     payload = _safe_json(response)

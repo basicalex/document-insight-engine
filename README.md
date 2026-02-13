@@ -19,7 +19,7 @@ Current state:
 - Engine internals for local QA, agent loop guard, and Tier 4 extraction are implemented.
 - API contracts for `/ingest` and `/ask` are implemented with validation and guardrails.
 - `POST /upload` alias is available for assignment-compatible upload calls.
-- Streamlit chat UI is available in `frontend/app.py` with mode toggle and trace viewer.
+- Streamlit UI is available in `frontend/app.py` with chat, structured extraction, runtime readiness, and observability panels.
 
 ## Included dummy test docs (committed)
 
@@ -76,6 +76,15 @@ Observability endpoints:
 ```bash
 docker compose up --build
 ```
+
+By default, compose runs deep mode with local provider settings for full-feature
+UI coverage:
+
+- `DEEP_MODE_ENABLED=true`
+- `CLOUD_AGENT_PROVIDER=local`
+
+To use Gemini instead, set `CLOUD_AGENT_PROVIDER=gemini` and provide
+`CLOUD_AGENT_API_KEY`.
 
 ## Setup (Docker dev overlay, fast iteration)
 
@@ -317,7 +326,7 @@ curl -X POST http://localhost:8000/ask \
 
 ## UI coverage
 
-- Current Streamlit UI supports upload/ingest, fast/deep ask, streaming responses, citations, and trace inspection.
-- API-only features not yet surfaced as dedicated UI workflows:
-  - `POST /extract` structured extraction form/results
-  - `GET /metrics` observability dashboard panel
+- Upload/ingest status, fast/deep ask, streaming responses, citations, and traces.
+- Structured extraction workflow (`POST /extract`) with schema/prompt controls.
+- Runtime readiness banner backed by `GET /healthz` capability diagnostics.
+- Observability panel showing `GET /healthz` telemetry snapshot and raw `GET /metrics` output.

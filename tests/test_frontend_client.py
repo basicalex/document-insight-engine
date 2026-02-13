@@ -199,3 +199,87 @@ def test_network_error_is_mapped_to_api_error() -> None:
 
     assert exc_info.value.status_code == 0
     assert exc_info.value.code == "network_error"
+
+
+def test_extract_sends_schema_and_prompt() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/extract"
+        payload = json.loads(request.content.decode("utf-8"))
+        assert payload == {
+            "document_id": "doc_123",
+            "schema": {
+                "type": "object",
+                "properties": {"total_due": {"type": "number"}},
+            },
+            "prompt": "Extract invoice fields",
+        }
+        return httpx.Response(
+            200,
+            json={
+                "document_id": "doc_123",
+                "data": {"total_due": 1234.0},
+            },
+        )
+
+    client = DocumentInsightApi(
+        base_url="http://testserver",
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler), base_url="http://testserver"
+        ),
+    )
+
+    response = client.extract(
+        document_id="doc_123",
+        extraction_schema={
+            "type": "object",
+            "properties": {"total_due": {"type": "number"}},
+        },
+        prompt="Extract invoice fields",
+    )
+
+    assert response["data"]["total_due"] == 1234.0
+
+
+def test_healthz_fetches_runtime_snapshot() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/healthz"
+        return httpx.Response(
+            200,
+            json={
+                "status": "ok",
+                "deep_provider": {"provider": "local", "ready": True},
+            },
+        )
+
+    client = DocumentInsightApi(
+        base_url="http://testserver",
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler), base_url="http://testserver"
+        ),
+    )
+
+    response = client.healthz()
+    assert response["status"] == "ok"
+    assert response["deep_provider"]["ready"] is True
+
+
+def test_metrics_fetches_plain_text_payload() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "GET"
+        assert request.url.path == "/metrics"
+        return httpx.Response(
+            200,
+            text="die_http_requests_total 12\ndie_qa_requests_total 3\n",
+        )
+
+    client = DocumentInsightApi(
+        base_url="http://testserver",
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler), base_url="http://testserver"
+        ),
+    )
+
+    metrics = client.metrics()
+    assert "die_http_requests_total" in metrics

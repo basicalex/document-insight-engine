@@ -40,6 +40,8 @@ services:
       LOCAL_LLM_MODEL: llama3.2:1b
       DATA_DIR: /app/data
       REQUEST_TIMEOUT_SECONDS: 120
+      DEEP_MODE_ENABLED: "true"
+      CLOUD_AGENT_PROVIDER: local
       DOCLING_ENABLED: "true"
       GOOGLE_PARSER_ENABLED: "true"
       LANGEXTRACT_ENABLED: "true"

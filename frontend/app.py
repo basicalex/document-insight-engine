@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import mimetypes
 from typing import Any
 
@@ -24,12 +25,18 @@ def main() -> None:
         layout="wide",
     )
     initialize_session_state(st.session_state)
+    if not st.session_state.get("runtime_bootstrapped", False):
+        _refresh_runtime_data(silent=True)
+        st.session_state["runtime_bootstrapped"] = True
 
     st.title("Document Insight Engine")
     st.caption("Upload a document, switch answer depth, and inspect grounded traces.")
 
     _render_sidebar()
     _render_status_bar()
+    _render_runtime_readiness_banner()
+    _render_observability_panel()
+    _render_extraction_result()
     _render_chat_history()
     _handle_chat_prompt()
 
@@ -39,7 +46,8 @@ def _render_sidebar() -> None:
 
     current_base_url = st.session_state["api_base_url"]
     base_url = st.sidebar.text_input("API base URL", value=current_base_url)
-    st.session_state["api_base_url"] = base_url.strip() or DEFAULT_API_BASE_URL
+    base_url_value = str(base_url or "").strip()
+    st.session_state["api_base_url"] = base_url_value or DEFAULT_API_BASE_URL
 
     mode_index = 0 if st.session_state["chat_mode"] == "fast" else 1
     selected_mode = st.sidebar.radio(
@@ -48,21 +56,21 @@ def _render_sidebar() -> None:
         index=mode_index,
         horizontal=True,
     )
-    set_mode(st.session_state, selected_mode)
+    set_mode(st.session_state, str(selected_mode))
 
     document_id_value = st.sidebar.text_input(
         "Document ID (optional)",
         value=st.session_state["active_document_id"],
         placeholder="doc_123",
     )
-    set_document_id(st.session_state, document_id_value)
+    set_document_id(st.session_state, str(document_id_value or ""))
 
     session_id_value = st.sidebar.text_input(
         "Session ID (optional)",
         value=st.session_state["session_id"],
         placeholder="chat_session_1",
     )
-    st.session_state["session_id"] = session_id_value.strip()
+    st.session_state["session_id"] = str(session_id_value or "").strip()
 
     uploaded_files = st.sidebar.file_uploader(
         "Upload file(s)",
@@ -79,6 +87,37 @@ def _render_sidebar() -> None:
     ):
         _refresh_ingest_status(st.session_state["active_document_id"])
 
+    st.sidebar.divider()
+    st.sidebar.subheader("Runtime")
+    if st.sidebar.button("Refresh runtime + metrics", use_container_width=True):
+        _refresh_runtime_data(silent=False)
+
+    st.sidebar.divider()
+    st.sidebar.subheader("Structured extract")
+    schema_text = st.sidebar.text_area(
+        "Schema JSON",
+        value=st.session_state["extract_schema_text"],
+        height=180,
+    )
+    st.session_state["extract_schema_text"] = schema_text
+    extract_prompt = st.sidebar.text_input(
+        "Extract prompt",
+        value=st.session_state["extract_prompt"],
+        placeholder="Extract requested fields with provenance",
+    )
+    st.session_state["extract_prompt"] = str(extract_prompt or "")
+
+    if st.sidebar.button(
+        "Run structured extract",
+        use_container_width=True,
+        disabled=not st.session_state["active_document_id"],
+    ):
+        _run_structured_extract(
+            document_id=st.session_state["active_document_id"],
+            schema_text=st.session_state["extract_schema_text"],
+            prompt=st.session_state["extract_prompt"],
+        )
+
     if st.sidebar.button("Clear chat", use_container_width=True):
         clear_chat(st.session_state)
 
@@ -91,12 +130,18 @@ def _render_status_bar() -> None:
     status_cols[1].metric("Document", active_document)
 
     status_cols[2].metric("Turns", str(len(st.session_state["messages"])))
-    latest_status = (
+    latest_ingest_status = (
         st.session_state["ingest_history"][-1]["status"]
         if st.session_state["ingest_history"]
         else "n/a"
     )
-    status_cols[3].metric("Ingest status", latest_status)
+    runtime = st.session_state.get("runtime_health") or {}
+    runtime_status = str(
+        runtime.get("readiness", {}).get("overall")
+        or runtime.get("status")
+        or latest_ingest_status
+    )
+    status_cols[3].metric("Runtime", runtime_status)
 
 
 def _handle_upload(uploaded_files: list[Any]) -> None:
@@ -153,6 +198,106 @@ def _refresh_ingest_status(document_id: str) -> None:
             "file_path": response.get("file_path"),
         }
     )
+
+
+def _refresh_runtime_data(*, silent: bool) -> None:
+    try:
+        with DocumentInsightApi(base_url=st.session_state["api_base_url"]) as api:
+            health = api.healthz()
+            metrics_text = api.metrics()
+    except ApiError as exc:
+        if not silent:
+            st.sidebar.error(_format_api_error(exc))
+        return
+
+    st.session_state["runtime_health"] = health
+    st.session_state["metrics_text"] = metrics_text
+    if not silent:
+        st.sidebar.success("Runtime and metrics refreshed")
+
+
+def _run_structured_extract(*, document_id: str, schema_text: str, prompt: str) -> None:
+    try:
+        schema_payload = json.loads(schema_text)
+    except json.JSONDecodeError as exc:
+        st.sidebar.error(f"Schema JSON is invalid: {exc.msg}")
+        return
+
+    if not isinstance(schema_payload, dict):
+        st.sidebar.error("Schema JSON must be an object")
+        return
+
+    with st.sidebar:
+        with st.spinner("Running structured extraction..."):
+            try:
+                with DocumentInsightApi(
+                    base_url=st.session_state["api_base_url"]
+                ) as api:
+                    result = api.extract(
+                        document_id=document_id,
+                        extraction_schema=schema_payload,
+                        prompt=prompt,
+                    )
+            except ApiError as exc:
+                st.error(_format_api_error(exc))
+                return
+
+    st.session_state["last_extract_result"] = result
+    st.sidebar.success("Structured extraction completed")
+
+
+def _render_runtime_readiness_banner() -> None:
+    runtime = st.session_state.get("runtime_health") or {}
+    if not runtime:
+        st.info(
+            "Runtime status not loaded yet. Use 'Refresh runtime + metrics' in sidebar."
+        )
+        return
+
+    issues: list[str] = []
+    chat_mode = st.session_state.get("chat_mode", "fast")
+    deep_provider = runtime.get("deep_provider") or {}
+    if chat_mode == "deep" and not bool(deep_provider.get("ready", False)):
+        issues.append(
+            f"deep provider is not ready ({deep_provider.get('reason', 'unknown')})"
+        )
+
+    capabilities = runtime.get("capabilities") or {}
+    for name, capability in capabilities.items():
+        if not isinstance(capability, dict):
+            continue
+        if bool(capability.get("enabled")) and not bool(capability.get("ready")):
+            issues.append(f"{name} not ready ({capability.get('reason', 'unknown')})")
+
+    if issues:
+        st.warning("Runtime readiness issues: " + "; ".join(issues))
+    else:
+        st.success("Runtime readiness looks good for active capabilities.")
+
+
+def _render_observability_panel() -> None:
+    with st.expander("Runtime observability", expanded=False):
+        runtime = st.session_state.get("runtime_health") or {}
+        observability = runtime.get("observability")
+        if isinstance(observability, dict):
+            st.json(observability)
+        else:
+            st.caption("Observability snapshot is not available yet.")
+
+        metrics_text = str(st.session_state.get("metrics_text") or "").strip()
+        if metrics_text:
+            st.code(metrics_text, language="text")
+        else:
+            st.caption("Metrics payload is not available yet.")
+
+
+def _render_extraction_result() -> None:
+    payload = st.session_state.get("last_extract_result")
+    if not isinstance(payload, dict):
+        return
+
+    with st.expander("Structured extraction result", expanded=False):
+        st.json(payload)
 
 
 def _render_chat_history() -> None:
