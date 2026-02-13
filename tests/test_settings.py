@@ -51,6 +51,12 @@ def test_settings_accepts_enabled_deep_mode_with_fallback_provider() -> None:
     assert cfg.deep_mode_enabled is True
 
 
+def test_settings_accepts_enabled_deep_mode_with_local_provider() -> None:
+    cfg = Settings(deep_mode_enabled=True, cloud_agent_provider="local")
+    assert cfg.deep_mode_enabled is True
+    assert cfg.cloud_agent_provider == "local"
+
+
 def test_settings_rejects_gemini_provider_without_api_key() -> None:
     with pytest.raises(ValidationError):
         Settings(cloud_agent_provider="gemini")
@@ -99,6 +105,16 @@ def test_settings_rejects_empty_api_state_key_prefix() -> None:
         Settings(api_state_key_prefix="   ")
 
 
+def test_settings_accepts_memory_ingestion_queue_backend() -> None:
+    cfg = Settings(ingestion_queue_backend="memory")
+    assert cfg.ingestion_queue_backend == "memory"
+
+
+def test_settings_rejects_empty_ingestion_queue_key_prefix() -> None:
+    with pytest.raises(ValidationError):
+        Settings(ingestion_queue_key_prefix="   ")
+
+
 def test_settings_allows_in_memory_index_fallback_in_dev() -> None:
     cfg = Settings(environment="dev", allow_in_memory_index_fallback=True)
     assert cfg.allow_in_memory_index_fallback is True
@@ -118,3 +134,21 @@ def test_settings_supports_optional_capability_toggles() -> None:
 def test_settings_accepts_parser_routing_modes() -> None:
     cfg = Settings(parser_routing_mode="google_docling_fallback")
     assert cfg.parser_routing_mode == "google_docling_fallback"
+
+
+def test_settings_rejects_invalid_slo_rate_bounds() -> None:
+    with pytest.raises(ValidationError):
+        Settings(slo_insufficient_evidence_rate_max=1.5)
+
+
+def test_settings_accepts_eval_threshold_overrides() -> None:
+    cfg = Settings(
+        eval_min_grounded_accuracy=0.95,
+        eval_max_hallucination_rate=0.05,
+        eval_min_citation_completeness=0.92,
+        eval_max_p95_latency_ms=1800,
+    )
+    assert cfg.eval_min_grounded_accuracy == 0.95
+    assert cfg.eval_max_hallucination_rate == 0.05
+    assert cfg.eval_min_citation_completeness == 0.92
+    assert cfg.eval_max_p95_latency_ms == 1800

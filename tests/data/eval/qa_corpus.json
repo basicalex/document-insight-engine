@@ -1,0 +1,35 @@
+{
+  "thresholds": {
+    "min_grounded_accuracy": 0.95,
+    "max_hallucination_rate": 0.1,
+    "min_citation_completeness": 0.95,
+    "max_p95_latency_ms": 1200
+  },
+  "cases": [
+    {
+      "case_id": "invoice_total_due",
+      "question": "What is the total due?",
+      "expected_substrings": [
+        "1234.00",
+        "USD"
+      ],
+      "forbidden_substrings": [
+        "9999"
+      ],
+      "require_citations": true,
+      "max_latency_ms": 1200
+    },
+    {
+      "case_id": "invoice_due_date",
+      "question": "What is the due date?",
+      "expected_substrings": [
+        "2026-03-01"
+      ],
+      "forbidden_substrings": [
+        "2027"
+      ],
+      "require_citations": true,
+      "max_latency_ms": 1200
+    }
+  ]
+}

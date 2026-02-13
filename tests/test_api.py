@@ -7,7 +7,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, cast
+from typing import Any, Iterator, Literal, cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -16,6 +16,13 @@ import src.api.main as api_main
 from src.api.main import ApiServices, app
 from src.api.state_store import InMemoryApiStateBackend, InMemoryApiStateStore
 from src.config.settings import Settings
+from src.engine.extractor import (
+    FieldProvenance,
+    StructuredExtractionEnvelope,
+    StructuredExtractionError,
+    StructuredExtractionResult,
+    ValidationDiagnostic,
+)
 from src.ingestion import (
     HybridVectorIndexStore,
     InMemoryIndexBackend,
@@ -93,6 +100,26 @@ class SlowLocalQAEngine(StubLocalQAEngine):
         )
 
 
+class TraceLocalQAEngine(StubLocalQAEngine):
+    def ask(
+        self,
+        question: str,
+        mode: Mode,
+        document_id: str | None,
+        chat_history: list[dict[str, str]] | None = None,
+    ) -> ChatResponse:
+        self.calls.append((question, mode, document_id))
+        self.chat_history_calls.append(chat_history)
+        return ChatResponse(
+            answer="local-answer",
+            mode=mode,
+            document_id=document_id,
+            insufficient_evidence=False,
+            citations=[],
+            trace=AgentTrace(model="local-qa-test", termination_reason="completed"),
+        )
+
+
 class StubCloudAgentEngine:
     def __init__(self) -> None:
         self.calls: list[tuple[str, Mode, str | None]] = []
@@ -141,6 +168,23 @@ class FailingCloudAgentEngine(StubCloudAgentEngine):
         )
 
 
+class StubStructuredExtractor:
+    def __init__(self, envelope: StructuredExtractionEnvelope) -> None:
+        self.envelope = envelope
+        self.calls: list[tuple[str, str, dict[str, Any], str | None]] = []
+
+    def extract_structured(
+        self,
+        *,
+        document_id: str,
+        document_text: str,
+        schema: dict[str, Any],
+        prompt: str | None = None,
+    ) -> StructuredExtractionEnvelope:
+        self.calls.append((document_id, document_text, schema, prompt))
+        return self.envelope
+
+
 class StubOrchestrator:
     def __init__(self, status: IngestionStatus = IngestionStatus.INDEXED) -> None:
         self.calls: list[tuple[str, Path, str, str | None]] = []
@@ -168,6 +212,46 @@ class StubOrchestrator:
         return record
 
 
+class RetryThenSuccessOrchestrator:
+    def __init__(self, failures_before_success: int) -> None:
+        self.failures_before_success = max(0, failures_before_success)
+        self.calls: list[tuple[str, Path, str, str | None]] = []
+
+    def process(
+        self,
+        document_id: str,
+        file_path: Path,
+        mime_type: str,
+        idempotency_key: str | None = None,
+    ) -> IngestionRecord:
+        self.calls.append((document_id, file_path, mime_type, idempotency_key))
+        if len(self.calls) <= self.failures_before_success:
+            raise RuntimeError("transient queue failure")
+        record = IngestionRecord(
+            document_id=document_id,
+            idempotency_key=idempotency_key or f"ingest-{document_id}",
+            status=IngestionStatus.INDEXED,
+            completed_stages=["extract", "parse", "chunk", "embed", "index"],
+        )
+        record.updated_at = datetime.now(timezone.utc)
+        return record
+
+
+class AlwaysFailOrchestrator:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Path, str, str | None]] = []
+
+    def process(
+        self,
+        document_id: str,
+        file_path: Path,
+        mime_type: str,
+        idempotency_key: str | None = None,
+    ) -> IngestionRecord:
+        self.calls.append((document_id, file_path, mime_type, idempotency_key))
+        raise RuntimeError("poison ingestion payload")
+
+
 def _make_services(
     *,
     tmp_path: Path,
@@ -175,18 +259,33 @@ def _make_services(
     cloud_agent: StubCloudAgentEngine | None = None,
     orchestrator: Any | None = None,
     state_store: InMemoryApiStateStore | None = None,
+    structured_extractor: Any | None = None,
     request_timeout_seconds: int = 10,
     deep_mode_enabled: bool = True,
     docling_enabled: bool = True,
     google_parser_enabled: bool = True,
     langextract_enabled: bool = True,
-    parser_routing_mode: str = "docling_google_fallback",
+    parser_routing_mode: Literal[
+        "docling_google_fallback",
+        "google_docling_fallback",
+        "docling_fallback",
+        "google_fallback",
+        "fallback_only",
+    ] = "docling_google_fallback",
+    ingestion_queue_max_retries: int = 2,
+    ingestion_queue_retry_backoff_seconds: float = 0.0,
+    ingestion_worker_concurrency: int = 1,
 ) -> ApiServices:
     cfg = Settings(
         data_dir=tmp_path,
         max_upload_size_mb=1,
         request_timeout_seconds=request_timeout_seconds,
         ingest_timeout_seconds=max(request_timeout_seconds, 1),
+        ingestion_queue_backend="memory",
+        ingestion_queue_max_retries=ingestion_queue_max_retries,
+        ingestion_queue_retry_backoff_seconds=ingestion_queue_retry_backoff_seconds,
+        ingestion_queue_poll_timeout_seconds=0.05,
+        ingestion_worker_concurrency=ingestion_worker_concurrency,
         deep_mode_enabled=deep_mode_enabled,
         cloud_agent_provider="fallback" if deep_mode_enabled else "disabled",
         docling_enabled=docling_enabled,
@@ -226,6 +325,7 @@ def _make_services(
             session_ttl_seconds=cfg.api_state_session_ttl_seconds,
             idempotency_claim_ttl_seconds=cfg.api_state_idempotency_claim_ttl_seconds,
         ),
+        structured_extractor=structured_extractor,
         orchestrator=orchestrator,
     )
 
@@ -253,6 +353,93 @@ def _client_with_services(services: ApiServices) -> Iterator[TestClient]:
     finally:
         if hasattr(app.state, "services"):
             delattr(app.state, "services")
+
+
+def _success_extraction_envelope(document_id: str) -> StructuredExtractionEnvelope:
+    return StructuredExtractionEnvelope(
+        ok=True,
+        result=StructuredExtractionResult(
+            document_id=document_id,
+            model="langextract",
+            prompt_version="tier4-extraction-v1",
+            data={"total_due": 1234.0},
+            provenance={
+                "total_due": FieldProvenance(
+                    start_offset=13,
+                    end_offset=20,
+                    text="1234.00",
+                )
+            },
+            accepted_fields=["total_due"],
+            rejected_fields=[],
+            diagnostics=[],
+            token_usage={"input_estimate": 20, "output_estimate": 10, "total": 30},
+            latency_ms=12,
+        ),
+        error=None,
+    )
+
+
+def _error_extraction_envelope(
+    *,
+    code: str,
+    message: str,
+    diagnostics: list[ValidationDiagnostic] | None = None,
+) -> StructuredExtractionEnvelope:
+    return StructuredExtractionEnvelope(
+        ok=False,
+        result=None,
+        error=StructuredExtractionError(
+            code=code,
+            message=message,
+            diagnostics=diagnostics or [],
+            token_usage={"input_estimate": 10, "output_estimate": 0, "total": 10},
+            latency_ms=5,
+        ),
+    )
+
+
+def _seed_ingestion_record(
+    *,
+    services: ApiServices,
+    document_id: str,
+    file_path: Path,
+    status: IngestionStatus = IngestionStatus.INDEXED,
+) -> None:
+    asyncio.run(
+        services.state_store.put_ingestion_record(
+            IngestResponse(
+                document_id=document_id,
+                file_path=str(file_path),
+                status=status,
+                message="seeded",
+            )
+        )
+    )
+
+
+def _wait_for_ingest_status(
+    client: TestClient,
+    *,
+    document_id: str,
+    expected: IngestionStatus,
+    timeout_seconds: float = 2.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    latest_payload: dict[str, Any] | None = None
+    while time.monotonic() < deadline:
+        status_response = client.get(f"/ingest/{document_id}")
+        assert status_response.status_code == 200
+        payload = cast(dict[str, Any], status_response.json())
+        latest_payload = payload
+        if payload.get("status") == expected.value:
+            return payload
+        time.sleep(0.02)
+
+    pytest.fail(
+        f"document {document_id} did not reach status {expected.value}; "
+        f"last payload={latest_payload}"
+    )
 
 
 def test_ingest_returns_contract_and_correlation_header(tmp_path: Path) -> None:
@@ -295,6 +482,25 @@ def test_healthz_includes_deep_provider_diagnostics(tmp_path: Path) -> None:
     assert body["readiness"]["overall"] == "ready"
     assert body["readiness"]["index"]["state"] == "ready"
     assert body["parser_routing_mode"] == "docling_google_fallback"
+
+
+def test_healthz_reports_local_deep_provider_as_ready(tmp_path: Path) -> None:
+    services = _make_services(tmp_path=tmp_path)
+    services.cfg = Settings(
+        data_dir=tmp_path,
+        deep_mode_enabled=True,
+        cloud_agent_provider="local",
+        ingestion_queue_backend="memory",
+    )
+
+    with _client_with_services(services) as client:
+        response = client.get("/healthz")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deep_provider"]["provider"] == "local"
+    assert body["deep_provider"]["ready"] is True
+    assert body["deep_provider"]["reason"] == "local_provider"
 
 
 def test_healthz_reports_optional_capability_diagnostics(
@@ -381,6 +587,46 @@ def test_healthz_marks_google_parser_disabled_by_config(tmp_path: Path) -> None:
     capabilities = response.json()["capabilities"]
     assert capabilities["google_parser"]["enabled"] is False
     assert capabilities["google_parser"]["reason"] == "disabled_by_config"
+
+
+def test_metrics_endpoint_exposes_http_and_qa_counters(tmp_path: Path) -> None:
+    services = _make_services(tmp_path=tmp_path)
+
+    with _client_with_services(services) as client:
+        ask_response = client.post(
+            "/ask",
+            json={"question": "What is due?", "mode": "fast", "document_id": "doc-1"},
+        )
+        assert ask_response.status_code == 200
+
+        metrics = client.get("/metrics")
+
+    assert metrics.status_code == 200
+    body = metrics.text
+    assert "die_http_requests_total" in body
+    assert "die_qa_requests_total" in body
+    assert "die_qa_insufficient_evidence_rate" in body
+
+
+def test_healthz_includes_observability_trace_linkage(tmp_path: Path) -> None:
+    services = _make_services(tmp_path=tmp_path, local_qa=TraceLocalQAEngine())
+
+    with _client_with_services(services) as client:
+        ask_response = client.post(
+            "/ask",
+            json={"question": "What is due?", "mode": "fast", "document_id": "doc-1"},
+            headers={"x-correlation-id": "corr-obsv-1"},
+        )
+        assert ask_response.status_code == 200
+        assert ask_response.headers.get("x-trace-id")
+
+        health = client.get("/healthz")
+
+    assert health.status_code == 200
+    observability = health.json()["observability"]
+    assert observability["qa"]["requests_total"] >= 1
+    assert observability["trace_links_recent"]
+    assert observability["trace_links_recent"][-1]["correlation_id"] == "corr-obsv-1"
 
 
 def test_parser_order_mode_mapping() -> None:
@@ -495,10 +741,17 @@ def test_ingest_runs_pipeline_when_orchestrator_is_configured(tmp_path: Path) ->
             },
         )
 
-    assert response.status_code == 201
-    body = response.json()
-    assert body["status"] == "indexed"
-    assert body["message"] == "indexed and ready for retrieval"
+        assert response.status_code == 201
+        body = response.json()
+        assert body["status"] == "uploaded"
+        assert body["message"] == "queued for processing"
+        final = _wait_for_ingest_status(
+            client,
+            document_id=body["document_id"],
+            expected=IngestionStatus.INDEXED,
+        )
+
+    assert final["message"] == "indexed and ready for retrieval"
     assert len(orchestrator.calls) == 1
 
 
@@ -608,11 +861,18 @@ def test_upload_alias_accepts_single_file_and_matches_ingest_shape(
             files={"file": ("invoice.pdf", b"%PDF-1.4\ninvoice", "application/pdf")},
         )
 
-    assert response.status_code == 201
-    body = response.json()
-    assert body["document_id"]
-    assert body["status"] == "indexed"
-    assert body["message"] == "indexed and ready for retrieval"
+        assert response.status_code == 201
+        body = response.json()
+        assert body["document_id"]
+        assert body["status"] == "uploaded"
+        assert body["message"] == "queued for processing"
+        final = _wait_for_ingest_status(
+            client,
+            document_id=body["document_id"],
+            expected=IngestionStatus.INDEXED,
+        )
+
+    assert final["status"] == "indexed"
 
 
 def test_upload_alias_accepts_multiple_files(tmp_path: Path) -> None:
@@ -628,11 +888,91 @@ def test_upload_alias_accepts_multiple_files(tmp_path: Path) -> None:
             ],
         )
 
-    assert response.status_code == 201
-    body = response.json()
-    assert body["count"] == 2
-    assert len(body["documents"]) == 2
-    assert all(item["status"] == "indexed" for item in body["documents"])
+        assert response.status_code == 201
+        body = response.json()
+        assert body["count"] == 2
+        assert len(body["documents"]) == 2
+        assert all(item["status"] == "uploaded" for item in body["documents"])
+        for item in body["documents"]:
+            _wait_for_ingest_status(
+                client,
+                document_id=item["document_id"],
+                expected=IngestionStatus.INDEXED,
+            )
+
+
+def test_ingest_queue_retries_transient_orchestration_failure(tmp_path: Path) -> None:
+    orchestrator = RetryThenSuccessOrchestrator(failures_before_success=1)
+    services = _make_services(
+        tmp_path=tmp_path,
+        orchestrator=orchestrator,
+        ingestion_queue_max_retries=2,
+        ingestion_queue_retry_backoff_seconds=0.0,
+    )
+
+    with _client_with_services(services) as client:
+        response = client.post(
+            "/ingest",
+            files={
+                "file": (
+                    "invoice.pdf",
+                    b"%PDF-1.4\ninvoice",
+                    "application/pdf",
+                )
+            },
+        )
+
+        assert response.status_code == 201
+        body = response.json()
+        assert body["status"] == "uploaded"
+        final = _wait_for_ingest_status(
+            client,
+            document_id=body["document_id"],
+            expected=IngestionStatus.INDEXED,
+        )
+
+    assert final["status"] == "indexed"
+    assert len(orchestrator.calls) == 2
+
+
+def test_ingest_queue_dead_letters_poison_payload_after_retry_exhaustion(
+    tmp_path: Path,
+) -> None:
+    orchestrator = AlwaysFailOrchestrator()
+    services = _make_services(
+        tmp_path=tmp_path,
+        orchestrator=orchestrator,
+        ingestion_queue_max_retries=1,
+        ingestion_queue_retry_backoff_seconds=0.0,
+    )
+
+    with _client_with_services(services) as client:
+        response = client.post(
+            "/ingest",
+            files={
+                "file": (
+                    "invoice.pdf",
+                    b"%PDF-1.4\ninvoice",
+                    "application/pdf",
+                )
+            },
+        )
+        assert response.status_code == 201
+        body = response.json()
+        final = _wait_for_ingest_status(
+            client,
+            document_id=body["document_id"],
+            expected=IngestionStatus.FAILED,
+            timeout_seconds=3.0,
+        )
+
+        health = client.get("/healthz")
+        assert health.status_code == 200
+        queue_report = health.json()["ingestion_queue"]
+
+    assert final["status"] == "failed"
+    assert len(orchestrator.calls) == 2
+    assert queue_report["dead_letter_jobs"] >= 1
 
 
 def test_ingest_unsupported_type_returns_normalized_error(tmp_path: Path) -> None:
@@ -650,6 +990,129 @@ def test_ingest_unsupported_type_returns_normalized_error(tmp_path: Path) -> Non
     assert body["code"] == "unsupported_mime_type"
     assert body["message"].startswith("unsupported MIME type")
     assert body["correlation_id"] == "corr-ingest-error"
+
+
+def test_extract_returns_structured_payload_and_persists_artifact(
+    tmp_path: Path,
+) -> None:
+    extractor = StubStructuredExtractor(_success_extraction_envelope("doc-1"))
+    services = _make_services(tmp_path=tmp_path, structured_extractor=extractor)
+    file_path = tmp_path / "invoice.pdf"
+    file_path.write_bytes(b"Invoice Total: 1234.00 USD")
+    _seed_ingestion_record(services=services, document_id="doc-1", file_path=file_path)
+
+    with _client_with_services(services) as client:
+        response = client.post(
+            "/extract",
+            json={
+                "document_id": "doc-1",
+                "schema": {
+                    "type": "object",
+                    "properties": {"total_due": {"type": "number"}},
+                    "required": ["total_due"],
+                },
+                "prompt": "Extract invoice fields",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["document_id"] == "doc-1"
+    assert body["data"]["total_due"] == 1234.0
+    assert Path(body["artifact_path"]).exists()
+    assert extractor.calls
+
+
+def test_extract_returns_422_for_invalid_schema(tmp_path: Path) -> None:
+    extractor = StubStructuredExtractor(
+        _error_extraction_envelope(
+            code="invalid_schema",
+            message="schema is invalid",
+        )
+    )
+    services = _make_services(tmp_path=tmp_path, structured_extractor=extractor)
+    file_path = tmp_path / "invoice.pdf"
+    file_path.write_bytes(b"Invoice Total: 1234.00 USD")
+    _seed_ingestion_record(services=services, document_id="doc-2", file_path=file_path)
+
+    with _client_with_services(services) as client:
+        response = client.post(
+            "/extract",
+            json={"document_id": "doc-2", "schema": {"type": "object"}},
+        )
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["code"] == "invalid_schema"
+
+
+def test_extract_returns_503_for_provider_failure(tmp_path: Path) -> None:
+    extractor = StubStructuredExtractor(
+        _error_extraction_envelope(
+            code="provider_error",
+            message="LangExtract provider unavailable",
+        )
+    )
+    services = _make_services(tmp_path=tmp_path, structured_extractor=extractor)
+    file_path = tmp_path / "invoice.pdf"
+    file_path.write_bytes(b"Invoice Total: 1234.00 USD")
+    _seed_ingestion_record(services=services, document_id="doc-3", file_path=file_path)
+
+    with _client_with_services(services) as client:
+        response = client.post(
+            "/extract",
+            json={
+                "document_id": "doc-3",
+                "schema": {
+                    "type": "object",
+                    "properties": {"total_due": {"type": "number"}},
+                },
+            },
+        )
+
+    assert response.status_code == 503
+    body = response.json()
+    assert body["code"] == "provider_error"
+
+
+def test_extract_returns_validation_diagnostics_for_provenance_mismatch(
+    tmp_path: Path,
+) -> None:
+    extractor = StubStructuredExtractor(
+        _error_extraction_envelope(
+            code="validation_failed",
+            message="structured extraction failed validation",
+            diagnostics=[
+                ValidationDiagnostic(
+                    code="provenance_text_mismatch",
+                    message="provenance text does not match offsets",
+                    field="total_due",
+                )
+            ],
+        )
+    )
+    services = _make_services(tmp_path=tmp_path, structured_extractor=extractor)
+    file_path = tmp_path / "invoice.pdf"
+    file_path.write_bytes(b"Invoice Total: 1234.00 USD")
+    _seed_ingestion_record(services=services, document_id="doc-4", file_path=file_path)
+
+    with _client_with_services(services) as client:
+        response = client.post(
+            "/extract",
+            json={
+                "document_id": "doc-4",
+                "schema": {
+                    "type": "object",
+                    "properties": {"total_due": {"type": "number"}},
+                },
+            },
+        )
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["code"] == "validation_failed"
+    diagnostics = body["details"]["diagnostics"]
+    assert diagnostics[0]["code"] == "provenance_text_mismatch"
 
 
 def test_ask_fast_mode_routes_to_local_engine(tmp_path: Path) -> None:

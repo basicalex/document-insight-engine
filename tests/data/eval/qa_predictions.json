@@ -1,0 +1,32 @@
+{
+  "predictions": [
+    {
+      "case_id": "invoice_total_due",
+      "answer": "The total due is 1234.00 USD.",
+      "insufficient_evidence": false,
+      "latency_ms": 420,
+      "citations": [
+        {
+          "chunk_id": "chunk-1",
+          "text": "Total Due: 1234.00 USD",
+          "start_offset": 11,
+          "end_offset": 31
+        }
+      ]
+    },
+    {
+      "case_id": "invoice_due_date",
+      "answer": "The due date is 2026-03-01.",
+      "insufficient_evidence": false,
+      "latency_ms": 510,
+      "citations": [
+        {
+          "chunk_id": "chunk-2",
+          "text": "Due Date: 2026-03-01",
+          "start_offset": 33,
+          "end_offset": 53
+        }
+      ]
+    }
+  ]
+}

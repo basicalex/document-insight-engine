@@ -6,23 +6,29 @@ import json
 import logging
 import mimetypes
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, AsyncIterator
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Header, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.concurrency import iterate_in_threadpool
 
 from src.config.settings import Settings, settings
+from src.api.ingestion_queue import (
+    IngestionQueueBackendError,
+    IngestionWorkerPool,
+    build_worker_pool_with_fallback,
+)
 from src.api.state_store import (
     ApiStateStore,
     ApiStateStoreError,
     InMemoryApiStateStore,
     RedisApiStateStore,
 )
+from src.api.telemetry import ObservabilityRegistry, ObservabilitySLOs
 from src.engine.cloud_agent import (
     CloudAgentEngine,
     CloudAgentModelClient,
@@ -30,6 +36,7 @@ from src.engine.cloud_agent import (
 )
 from src.engine.extractor import Tier4StructuredExtractor
 from src.engine.gemini_client import GeminiCloudModelClient
+from src.engine.local_agent_client import LocalDeepModelClient
 from src.engine.local_llm import LocalQAEngine, ProviderQueryEmbedder
 from src.ingestion.embeddings import (
     build_ingestion_embedding_clients,
@@ -129,6 +136,8 @@ class ApiServices:
     state_store: ApiStateStore
     structured_extractor: Tier4StructuredExtractor | None = None
     orchestrator: IngestionOrchestrator | None = None
+    ingestion_worker_pool: IngestionWorkerPool | None = None
+    telemetry: ObservabilityRegistry = field(default_factory=ObservabilityRegistry)
 
 
 app = FastAPI(title=settings.project_name)
@@ -176,6 +185,49 @@ def _index_fallback_allowed(cfg: Settings) -> bool:
     return cfg.allow_in_memory_index_fallback and cfg.environment in {"local", "dev"}
 
 
+def _build_ingestion_worker_pool(
+    *,
+    cfg: Settings,
+    state_store: ApiStateStore,
+    orchestrator: IngestionOrchestrator,
+    telemetry: ObservabilityRegistry,
+) -> IngestionWorkerPool:
+    try:
+        return build_worker_pool_with_fallback(
+            requested_backend=cfg.ingestion_queue_backend,
+            redis_url=cfg.redis_url,
+            key_prefix=cfg.ingestion_queue_key_prefix,
+            dead_letter_max_items=cfg.ingestion_queue_dead_letter_max_items,
+            state_store=state_store,
+            orchestrator=orchestrator,
+            worker_concurrency=cfg.ingestion_worker_concurrency,
+            max_retries=cfg.ingestion_queue_max_retries,
+            retry_backoff_seconds=cfg.ingestion_queue_retry_backoff_seconds,
+            poll_timeout_seconds=cfg.ingestion_queue_poll_timeout_seconds,
+            ingest_timeout_seconds=cfg.ingest_timeout_seconds,
+            telemetry=telemetry,
+        )
+    except IngestionQueueBackendError:
+        raise
+    except Exception as exc:
+        raise IngestionQueueBackendError(
+            f"failed to configure ingestion queue worker pool: {exc}"
+        ) from exc
+
+
+def _build_telemetry(cfg: Settings) -> ObservabilityRegistry:
+    return ObservabilityRegistry(
+        slos=ObservabilitySLOs(
+            http_request_p95_ms=cfg.slo_http_request_p95_ms,
+            retrieval_p95_ms=cfg.slo_retrieval_p95_ms,
+            generation_p95_ms=cfg.slo_generation_p95_ms,
+            insufficient_evidence_rate_max=cfg.slo_insufficient_evidence_rate_max,
+            citation_completeness_min=cfg.slo_citation_completeness_min,
+            grounding_gap_rate_max=cfg.slo_grounding_gap_rate_max,
+        )
+    )
+
+
 def _build_index_store(cfg: Settings) -> tuple[HybridVectorIndexStore, dict[str, Any]]:
     fallback_allowed = _index_fallback_allowed(cfg)
     logger.info(
@@ -220,6 +272,7 @@ def _build_index_store(cfg: Settings) -> tuple[HybridVectorIndexStore, dict[str,
 
 
 def _build_default_services(cfg: Settings) -> ApiServices:
+    telemetry = _build_telemetry(cfg)
     index_store, index_readiness = _build_index_store(cfg)
 
     extractor = BestEffortTextExtractor()
@@ -240,6 +293,8 @@ def _build_default_services(cfg: Settings) -> ApiServices:
     model_client: CloudAgentModelClient
     if cfg.cloud_agent_provider == "gemini":
         model_client = GeminiCloudModelClient(cfg=cfg)
+    elif cfg.cloud_agent_provider == "local":
+        model_client = LocalDeepModelClient(cfg=cfg)
     elif cfg.cloud_agent_provider == "fallback":
         model_client = _FallbackCloudModelClient()
     else:
@@ -256,6 +311,23 @@ def _build_default_services(cfg: Settings) -> ApiServices:
 
     _log_runtime_capabilities(cfg)
 
+    state_store = _build_state_store(cfg)
+    orchestrator = IngestionOrchestrator(
+        extractor=extractor,
+        parser=parser,
+        chunker=chunker,
+        embedder=embedder,
+        index_store=index_store,
+        max_retries_per_stage=2,
+        retry_backoff_seconds=0.0,
+    )
+    ingestion_worker_pool = _build_ingestion_worker_pool(
+        cfg=cfg,
+        state_store=state_store,
+        orchestrator=orchestrator,
+        telemetry=telemetry,
+    )
+
     return ApiServices(
         cfg=cfg,
         intake=UploadIntakeService(cfg),
@@ -271,23 +343,33 @@ def _build_default_services(cfg: Settings) -> ApiServices:
             query_vector_dimension=cfg.local_embedding_dimension,
         ),
         cloud_agent=CloudAgentEngine(model_client=model_client, cfg=cfg),
-        state_store=_build_state_store(cfg),
+        state_store=state_store,
         structured_extractor=Tier4StructuredExtractor(
             cfg=cfg,
             max_input_tokens=cfg.extraction_max_input_tokens,
             max_output_tokens=cfg.extraction_max_output_tokens,
             strict_schema=cfg.extraction_strict_schema,
         ),
-        orchestrator=IngestionOrchestrator(
-            extractor=extractor,
-            parser=parser,
-            chunker=chunker,
-            embedder=embedder,
-            index_store=index_store,
-            max_retries_per_stage=2,
-            retry_backoff_seconds=0.0,
-        ),
+        orchestrator=orchestrator,
+        ingestion_worker_pool=ingestion_worker_pool,
+        telemetry=telemetry,
     )
+
+
+def _ensure_ingestion_workers_running(services: ApiServices) -> None:
+    if services.orchestrator is None:
+        return
+
+    if services.ingestion_worker_pool is None:
+        services.ingestion_worker_pool = _build_ingestion_worker_pool(
+            cfg=services.cfg,
+            state_store=services.state_store,
+            orchestrator=services.orchestrator,
+            telemetry=services.telemetry,
+        )
+
+    if not services.ingestion_worker_pool.is_running:
+        services.ingestion_worker_pool.start()
 
 
 def get_services(request: Request) -> ApiServices:
@@ -295,6 +377,7 @@ def get_services(request: Request) -> ApiServices:
     if services is None:
         services = _build_default_services(get_app_settings())
         request.app.state.services = services
+    _ensure_ingestion_workers_running(services)
     return services
 
 
@@ -303,6 +386,7 @@ def ensure_runtime_dirs() -> None:
     settings.ensure_runtime_dirs()
     if not hasattr(app.state, "services"):
         app.state.services = _build_default_services(settings)
+    _ensure_ingestion_workers_running(app.state.services)
 
 
 @app.on_event("shutdown")
@@ -310,6 +394,13 @@ async def close_runtime_services() -> None:
     services = getattr(app.state, "services", None)
     if services is None:
         return
+    if services.ingestion_worker_pool is not None:
+        try:
+            await services.ingestion_worker_pool.stop()
+        except Exception:
+            logger.warning(
+                "Failed to stop ingestion worker pool cleanly", exc_info=True
+            )
     try:
         await services.state_store.close()
     except Exception:
@@ -318,12 +409,49 @@ async def close_runtime_services() -> None:
 
 @app.middleware("http")
 async def correlation_id_middleware(request: Request, call_next: Any) -> Response:
+    started = time.perf_counter()
     correlation_id = request.headers.get("x-correlation-id") or uuid4().hex
     request.state.correlation_id = correlation_id
 
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    except Exception:
+        latency_ms = int((time.perf_counter() - started) * 1000)
+        _record_http_telemetry(
+            request=request,
+            status_code=500,
+            latency_ms=latency_ms,
+        )
+        raise
+
+    latency_ms = int((time.perf_counter() - started) * 1000)
+    _record_http_telemetry(
+        request=request,
+        status_code=response.status_code,
+        latency_ms=latency_ms,
+    )
     response.headers["x-correlation-id"] = correlation_id
     return response
+
+
+def _record_http_telemetry(
+    *,
+    request: Request,
+    status_code: int,
+    latency_ms: int,
+) -> None:
+    services = getattr(request.app.state, "services", None)
+    if services is None or not isinstance(services, ApiServices):
+        return
+
+    route = request.scope.get("route")
+    route_path = getattr(route, "path", request.url.path)
+    services.telemetry.record_http_request(
+        route=str(route_path),
+        method=request.method,
+        status_code=status_code,
+        latency_ms=latency_ms,
+    )
 
 
 @app.exception_handler(ApiError)
@@ -351,6 +479,25 @@ async def validation_error_handler(
     )
 
 
+def _ingestion_queue_report(services: ApiServices) -> dict[str, Any]:
+    if services.orchestrator is None:
+        return {
+            "enabled": False,
+            "reason": "orchestrator_not_configured",
+        }
+
+    pool = services.ingestion_worker_pool
+    if pool is None:
+        return {
+            "enabled": False,
+            "reason": "worker_pool_unavailable",
+        }
+
+    report = pool.diagnostics()
+    report["enabled"] = True
+    return report
+
+
 @app.get("/healthz")
 def healthz(services: ApiServices = Depends(get_services)) -> dict[str, Any]:
     backend_name = type(services.index_store.backend).__name__
@@ -368,6 +515,8 @@ def healthz(services: ApiServices = Depends(get_services)) -> dict[str, Any]:
         "deep_provider": _deep_provider_diagnostics(services.cfg),
         "dependencies": _runtime_dependency_report(),
         "capabilities": _runtime_capabilities_report(services.cfg),
+        "ingestion_queue": _ingestion_queue_report(services),
+        "observability": services.telemetry.snapshot(),
     }
 
 
@@ -380,6 +529,11 @@ def readyz(
     if readiness["overall"] != "ready":
         response.status_code = 503
     return readiness
+
+
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics(services: ApiServices = Depends(get_services)) -> str:
+    return services.telemetry.render_prometheus()
 
 
 @app.post("/ingest", response_model=IngestResponse, status_code=201)
@@ -437,7 +591,7 @@ async def extract_structured_fields(
         extractor.extract_structured,
         document_id=payload.document_id,
         document_text=document_text,
-        schema=payload.schema,
+        schema=payload.extraction_schema,
         prompt=payload.prompt,
     )
 
@@ -478,7 +632,7 @@ async def extract_structured_fields(
     artifact_path = _persist_extraction_artifact(
         document_id=payload.document_id,
         prompt=payload.prompt,
-        schema=payload.schema,
+        schema=payload.extraction_schema,
         response=StructuredExtractResponse(
             document_id=envelope.result.document_id,
             model=envelope.result.model,
@@ -632,6 +786,7 @@ async def _ingest_upload(
                 mime_type=_normalize_upload_mime(
                     upload, receipt_file_path=str(receipt.file_path)
                 ),
+                idempotency_key=idempotency_key,
             )
             await services.state_store.put_idempotency_response(
                 idempotency_key,
@@ -651,6 +806,7 @@ async def _ingest_upload(
             mime_type=_normalize_upload_mime(
                 upload, receipt_file_path=str(receipt.file_path)
             ),
+            idempotency_key=idempotency_key,
         )
         return ingest_response, False
     except ApiError:
@@ -695,6 +851,7 @@ async def _build_ingest_response_for_receipt(
     receipt: Any,
     services: ApiServices,
     mime_type: str,
+    idempotency_key: str | None,
 ) -> IngestResponse:
     if services.orchestrator is None:
         response = _build_ingest_response(
@@ -702,28 +859,49 @@ async def _build_ingest_response_for_receipt(
             file_path=str(receipt.file_path),
         )
         await services.state_store.put_ingestion_record(response)
+        services.telemetry.record_ingestion_status(response.status)
         return response
 
-    record = await _run_orchestration_with_timeout(
-        services=services,
+    response = _build_ingest_response(
+        document_id=receipt.document_id,
+        file_path=str(receipt.file_path),
+    )
+    await services.state_store.put_ingestion_record(response)
+    services.telemetry.record_ingestion_status(response.status)
+
+    worker_pool = services.ingestion_worker_pool
+    if worker_pool is None:
+        record = await _run_orchestration_with_timeout(
+            services=services,
+            document_id=receipt.document_id,
+            file_path=Path(receipt.file_path),
+            mime_type=mime_type,
+        )
+        message = _ingestion_status_message(record.status, record.error_message)
+        synchronous_response = IngestResponse(
+            document_id=receipt.document_id,
+            file_path=str(receipt.file_path),
+            status=record.status,
+            message=message,
+        )
+        await services.state_store.put_ingestion_record(synchronous_response)
+        services.telemetry.record_ingestion_status(synchronous_response.status)
+        return synchronous_response
+
+    await worker_pool.enqueue(
         document_id=receipt.document_id,
         file_path=Path(receipt.file_path),
         mime_type=mime_type,
+        idempotency_key=idempotency_key,
     )
-    message = _ingestion_status_message(record.status, record.error_message)
-    response = IngestResponse(
-        document_id=receipt.document_id,
-        file_path=str(receipt.file_path),
-        status=record.status,
-        message=message,
-    )
-    await services.state_store.put_ingestion_record(response)
     return response
 
 
 @app.post("/ask", response_model=ChatResponse)
 async def ask(
     payload: ChatRequest,
+    request: Request,
+    response: Response,
     services: ApiServices = Depends(get_services),
 ) -> ChatResponse:
     try:
@@ -736,7 +914,7 @@ async def ask(
             document_id=payload.document_id,
         )
 
-        response: ChatResponse
+        chat_response: ChatResponse
 
         if payload.mode == Mode.DEEP:
             if not services.cfg.deep_mode_enabled:
@@ -746,7 +924,7 @@ async def ask(
                     status_code=503,
                     details={"cloud_agent_provider": services.cfg.cloud_agent_provider},
                 )
-            response = await _ask_with_timeout(
+            chat_response = await _ask_with_timeout(
                 handler=lambda: services.cloud_agent.ask(
                     question=payload.question,
                     mode=payload.mode,
@@ -754,9 +932,9 @@ async def ask(
                 ),
                 timeout_seconds=services.cfg.request_timeout_seconds,
             )
-            _raise_if_deep_provider_failed(response)
+            _raise_if_deep_provider_failed(chat_response)
         else:
-            response = await _ask_with_timeout(
+            chat_response = await _ask_with_timeout(
                 handler=lambda: services.local_qa.ask(
                     question=payload.question,
                     mode=payload.mode,
@@ -771,9 +949,16 @@ async def ask(
             session_id=payload.session_id,
             document_id=payload.document_id,
             question=payload.question,
-            answer=response.answer,
+            answer=chat_response.answer,
         )
-        return response
+        _record_qa_telemetry(
+            services=services,
+            request=request,
+            chat_response=chat_response,
+        )
+        if chat_response.trace is not None:
+            response.headers["x-trace-id"] = chat_response.trace.trace_id
+        return chat_response
     except IndexingError as exc:
         raise ApiError(
             code="retrieval_unavailable",
@@ -795,6 +980,7 @@ async def ask(
 @app.post("/ask/stream")
 async def ask_stream(
     payload: ChatRequest,
+    request: Request,
     services: ApiServices = Depends(get_services),
 ) -> StreamingResponse:
     try:
@@ -836,6 +1022,7 @@ async def ask_stream(
         async def stream_body() -> AsyncIterator[bytes]:
             streamed_tokens: list[str] = []
             final_answer: str | None = None
+            final_chat_response: ChatResponse | None = None
 
             async for event in iterate_in_threadpool(events):
                 if not isinstance(event, dict):
@@ -849,6 +1036,12 @@ async def ask_stream(
                 elif event_type == "final":
                     response_payload = event.get("response")
                     if isinstance(response_payload, dict):
+                        try:
+                            final_chat_response = ChatResponse.model_validate(
+                                response_payload
+                            )
+                        except Exception:
+                            final_chat_response = None
                         answer = str(response_payload.get("answer", "")).strip()
                         if answer:
                             final_answer = answer
@@ -867,6 +1060,13 @@ async def ask_stream(
                     document_id=payload.document_id,
                     question=payload.question,
                     answer=final_answer,
+                )
+
+            if final_chat_response is not None:
+                _record_qa_telemetry(
+                    services=services,
+                    request=request,
+                    chat_response=final_chat_response,
                 )
 
         return StreamingResponse(
@@ -1005,6 +1205,20 @@ def _chunk_stream_text(text: str, *, chunk_size: int) -> Any:
 
 def _serialize_stream_event(event: dict[str, Any]) -> bytes:
     return (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+
+
+def _record_qa_telemetry(
+    *,
+    services: ApiServices,
+    request: Request,
+    chat_response: ChatResponse,
+) -> None:
+    services.telemetry.record_chat_response(chat_response)
+    trace_id = chat_response.trace.trace_id if chat_response.trace else None
+    services.telemetry.record_trace_link(
+        correlation_id=getattr(request.state, "correlation_id", None),
+        trace_id=trace_id,
+    )
 
 
 def _build_error_response(
@@ -1331,6 +1545,15 @@ def _deep_provider_diagnostics(cfg: Settings) -> dict[str, Any]:
             "provider": provider,
             "ready": False,
             "reason": "fallback_provider",
+        }
+    if provider == "local":
+        return {
+            "provider": provider,
+            "ready": True,
+            "reason": "local_provider",
+            "model": cfg.local_llm_model,
+            "base_url": cfg.ollama_base_url,
+            "timeout_seconds": cfg.cloud_agent_timeout_seconds,
         }
 
     api_key_present = bool((cfg.cloud_agent_api_key or "").strip())

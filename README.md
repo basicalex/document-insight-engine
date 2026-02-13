@@ -63,6 +63,14 @@ curl http://localhost:8000/healthz
 LangExtract under `capabilities`, including `enabled`, `ready`, and
 actionable `hint` values when dependencies are missing or disabled.
 
+Observability endpoints:
+
+- `GET /metrics` exposes Prometheus-style counters/gauges for HTTP latency,
+  ingestion retries/dead letters, insufficient-evidence rate, and citation
+  completeness.
+- `GET /healthz` now includes an `observability` snapshot and SLO pass/fail
+  checks.
+
 ## Setup (Docker)
 
 ```bash
@@ -111,20 +119,39 @@ Current API endpoints:
 
 - `GET /healthz`
 - `GET /readyz`
+- `GET /metrics`
 - `POST /ingest`
 - `GET /ingest/{document_id}`
 - `POST /upload`
 - `POST /ask`
 - `POST /ask/stream`
-
-Planned/next API endpoints:
-
-- Real deep-mode provider integration beyond fallback scripted behavior
+- `POST /extract`
 
 Deep mode capability:
 
 - Deep mode is disabled by default at runtime.
-- Enable with env vars: `DEEP_MODE_ENABLED=true` and `CLOUD_AGENT_PROVIDER=fallback`.
+- Enable with env vars:
+  - local deep agent: `DEEP_MODE_ENABLED=true` and `CLOUD_AGENT_PROVIDER=local`
+  - Gemini deep agent: `DEEP_MODE_ENABLED=true`, `CLOUD_AGENT_PROVIDER=gemini`, and `CLOUD_AGENT_API_KEY=...`
+
+Full-feature runtime profile:
+
+- Install optional dependencies: `python -m pip install -e .[ai,ui,dev]`
+- Keep Redis and Ollama running (`docker compose up -d redis ollama` or equivalent)
+- For local deep mode via Ollama:
+  - `DEEP_MODE_ENABLED=true`
+  - `CLOUD_AGENT_PROVIDER=local`
+- For Gemini deep mode + Google parser routing:
+  - `DEEP_MODE_ENABLED=true`
+  - `CLOUD_AGENT_PROVIDER=gemini`
+  - `CLOUD_AGENT_API_KEY=<your key>`
+- For structured extraction with LangExtract:
+  - `LANGEXTRACT_ENABLED=true` (default)
+  - ensure `langextract` package/runtime credentials are available
+- Verify readiness at runtime with `GET /healthz`:
+  - `deep_provider.ready == true`
+  - `capabilities.google_parser.ready == true` (when using Google parser)
+  - `capabilities.langextract_extractor.ready == true`
 
 Parser routing capability:
 
@@ -137,6 +164,24 @@ Index backend policy:
 - API startup now fails fast if Redis/RedisVL index bootstrap is unavailable.
 - Local/dev fallback to in-memory indexing is only allowed when explicitly enabled with `ALLOW_IN_MEMORY_INDEX_FALLBACK=true`.
 - `GET /readyz` reports `200` only when index backend is fully ready; degraded fallback mode reports `503` with diagnostics.
+
+Observability and evaluation:
+
+- Correlation IDs (`x-correlation-id`) are linked with response trace IDs in
+  telemetry for request-to-trace debugging.
+- `GET /metrics` exposes Prometheus-style metrics for HTTP latency/error rates,
+  ingestion retries/dead-letters, and QA grounding/citation quality.
+- Evaluation harness lives at `src/evals/harness.py` with curated fixtures in
+  `tests/data/eval/`.
+- Run the benchmark gate locally:
+
+```bash
+python -m src.evals.harness \
+  --corpus tests/data/eval/qa_corpus.json \
+  --predictions tests/data/eval/qa_predictions.json \
+  --report-path data/traces/eval_report.json \
+  --assert-thresholds
+```
 
 Contract examples:
 
@@ -266,5 +311,13 @@ curl -X POST http://localhost:8000/ask \
 
 - `src/engine/local_llm.py`: grounded local QA flow with retrieval-first prompting, insufficient-evidence fallback, and trace metadata.
 - `src/engine/cloud_agent.py`: strict tool-allowlisted agent orchestration (`list_sections`, `read_section`, `keyword_grep`) with hard 5-iteration guard.
+- `src/engine/local_agent_client.py`: Ollama-backed local deep-agent provider for tool-planning fallback when cloud provider is unavailable.
 - `src/engine/extractor.py`: Tier 4 structured extraction adapter with schema validation, per-field provenance offset checks, and token-budget preflight guards.
 - `src/tools/fs_tools.py`: deterministic markdown filesystem tools used by agent reasoning.
+
+## UI coverage
+
+- Current Streamlit UI supports upload/ingest, fast/deep ask, streaming responses, citations, and trace inspection.
+- API-only features not yet surfaced as dedicated UI workflows:
+  - `POST /extract` structured extraction form/results
+  - `GET /metrics` observability dashboard panel

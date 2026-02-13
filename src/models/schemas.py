@@ -93,8 +93,10 @@ class UploadBatchResponse(BaseModel):
 
 
 class StructuredExtractRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     document_id: str = Field(min_length=1)
-    schema: dict[str, Any]
+    extraction_schema: dict[str, Any] = Field(alias="schema")
     prompt: str | None = None
 
 

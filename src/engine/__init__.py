@@ -18,6 +18,7 @@ from src.engine.extractor import (
     extract_structured,
 )
 from src.engine.gemini_client import GeminiCloudModelClient
+from src.engine.local_agent_client import LocalDeepModelClient
 from src.engine.local_llm import (
     HashingQueryEmbedder,
     LocalQAEngine,
@@ -37,6 +38,7 @@ __all__ = [
     "FieldProvenance",
     "HashingQueryEmbedder",
     "GeminiCloudModelClient",
+    "LocalDeepModelClient",
     "LocalQAEngine",
     "OllamaGenerateError",
     "ProviderQueryEmbedder",

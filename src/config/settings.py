@@ -55,6 +55,25 @@ class Settings(BaseSettings):
     api_state_session_ttl_seconds: PositiveInt = 7 * 24 * 60 * 60
     api_state_idempotency_claim_ttl_seconds: PositiveInt = 5 * 60
     api_state_session_max_turns: PositiveInt = 8
+    ingestion_queue_backend: Literal["auto", "redis", "memory"] = "auto"
+    ingestion_queue_key_prefix: str = "die:queue"
+    ingestion_worker_concurrency: PositiveInt = 1
+    ingestion_queue_max_retries: int = Field(default=2, ge=0, le=10)
+    ingestion_queue_retry_backoff_seconds: float = Field(default=0.25, ge=0.0, le=30.0)
+    ingestion_queue_poll_timeout_seconds: float = Field(default=1.0, gt=0.0, le=30.0)
+    ingestion_queue_dead_letter_max_items: PositiveInt = 500
+
+    slo_http_request_p95_ms: PositiveInt = 1500
+    slo_retrieval_p95_ms: PositiveInt = 1000
+    slo_generation_p95_ms: PositiveInt = 2500
+    slo_insufficient_evidence_rate_max: float = Field(default=0.35, ge=0.0, le=1.0)
+    slo_citation_completeness_min: float = Field(default=0.90, ge=0.0, le=1.0)
+    slo_grounding_gap_rate_max: float = Field(default=0.20, ge=0.0, le=1.0)
+
+    eval_min_grounded_accuracy: float = Field(default=0.90, ge=0.0, le=1.0)
+    eval_max_hallucination_rate: float = Field(default=0.10, ge=0.0, le=1.0)
+    eval_min_citation_completeness: float = Field(default=0.90, ge=0.0, le=1.0)
+    eval_max_p95_latency_ms: PositiveInt = 2500
 
     ollama_base_url: str = "http://ollama:11434"
     local_llm_model: str = "llama3.2:1b"
@@ -85,7 +104,9 @@ class Settings(BaseSettings):
     extraction_strict_schema: bool = True
 
     deep_mode_enabled: bool = False
-    cloud_agent_provider: Literal["disabled", "fallback", "gemini"] = "disabled"
+    cloud_agent_provider: Literal["disabled", "fallback", "gemini", "local"] = (
+        "disabled"
+    )
     cloud_agent_model: str = "gemini-2.5-flash"
     cloud_agent_api_key: str | None = None
     cloud_agent_api_base_url: str = "https://generativelanguage.googleapis.com"
@@ -114,12 +135,12 @@ class Settings(BaseSettings):
             raise ValueError("directory names must be relative and traversal-safe")
         return value
 
-    @field_validator("api_state_key_prefix")
+    @field_validator("api_state_key_prefix", "ingestion_queue_key_prefix")
     @classmethod
-    def validate_state_key_prefix(cls, value: str) -> str:
+    def validate_key_prefix(cls, value: str) -> str:
         normalized = value.strip()
         if not normalized:
-            raise ValueError("api_state_key_prefix cannot be empty")
+            raise ValueError("key prefix cannot be empty")
         return normalized
 
     @model_validator(mode="after")
