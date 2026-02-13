@@ -182,6 +182,14 @@ class IngestionOrchestrator:
                 extraction = output
             elif stage_name == "parse":
                 parsed = output
+                parser_name = str(getattr(output, "parser_name", "unknown"))
+                self._event(
+                    record=record,
+                    stage="parse",
+                    level="info",
+                    message="parser selected",
+                    metadata={"parser": parser_name},
+                )
             elif stage_name == "chunk":
                 chunked = output
             elif stage_name == "embed":

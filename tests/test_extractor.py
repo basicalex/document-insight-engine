@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from src.config.settings import Settings
 from src.engine.extractor import Tier4StructuredExtractor
 
 
@@ -133,4 +134,23 @@ def test_tier4_extractor_fails_fast_when_input_token_budget_exceeded() -> None:
     assert any(
         item.code == "input_budget_exceeded" for item in envelope.error.diagnostics
     )
+    assert client.calls == 0
+
+
+def test_tier4_extractor_respects_langextract_capability_toggle() -> None:
+    client = StubLangExtractClient(payload={"data": {}, "provenance": {}})
+    extractor = Tier4StructuredExtractor(
+        cfg=Settings(langextract_enabled=False),
+        client=client,
+    )
+
+    envelope = extractor.extract_structured(
+        document_id="doc-4",
+        document_text="Invoice Total: 1234.00 USD",
+        schema=_schema(),
+    )
+
+    assert envelope.ok is False
+    assert envelope.error is not None
+    assert envelope.error.code == "provider_disabled"
     assert client.calls == 0

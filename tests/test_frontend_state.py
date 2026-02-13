@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from frontend.state import (
@@ -13,7 +15,7 @@ from frontend.state import (
 
 
 def test_initialize_session_state_sets_expected_defaults() -> None:
-    state: dict[str, object] = {}
+    state: dict[str, Any] = {}
 
     initialize_session_state(state)
 
@@ -26,7 +28,7 @@ def test_initialize_session_state_sets_expected_defaults() -> None:
 
 
 def test_initialize_session_state_preserves_existing_values() -> None:
-    state: dict[str, object] = {
+    state: dict[str, Any] = {
         "api_base_url": "http://api.example",
         "chat_mode": "deep",
         "messages": [{"role": "user", "content": "hello"}],
@@ -39,8 +41,19 @@ def test_initialize_session_state_preserves_existing_values() -> None:
     assert len(state["messages"]) == 1
 
 
+def test_initialize_session_state_honors_api_base_url_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("DOCUMENT_INSIGHT_API_BASE_URL", "http://api:8000")
+    state: dict[str, Any] = {}
+
+    initialize_session_state(state)
+
+    assert state["api_base_url"] == "http://api:8000"
+
+
 def test_set_mode_rejects_unknown_values() -> None:
-    state: dict[str, object] = {}
+    state: dict[str, Any] = {}
     initialize_session_state(state)
 
     with pytest.raises(ValueError, match="unsupported mode"):
@@ -48,7 +61,7 @@ def test_set_mode_rejects_unknown_values() -> None:
 
 
 def test_chat_message_helpers_append_messages_and_clear() -> None:
-    state: dict[str, object] = {}
+    state: dict[str, Any] = {}
     initialize_session_state(state)
 
     append_user_message(state, "What is the renewal date?")

@@ -2,29 +2,48 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import logging
 import mimetypes
-from dataclasses import dataclass, field
+import time
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, AsyncIterator
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Header, Request, Response, UploadFile
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.concurrency import iterate_in_threadpool
 
 from src.config.settings import Settings, settings
-from src.engine.cloud_agent import CloudAgentEngine, CloudAgentModelClient
-from src.engine.local_llm import LocalQAEngine
+from src.api.state_store import (
+    ApiStateStore,
+    ApiStateStoreError,
+    InMemoryApiStateStore,
+    RedisApiStateStore,
+)
+from src.engine.cloud_agent import (
+    CloudAgentEngine,
+    CloudAgentModelClient,
+    DeepProviderErrorCode,
+)
+from src.engine.extractor import Tier4StructuredExtractor
+from src.engine.gemini_client import GeminiCloudModelClient
+from src.engine.local_llm import LocalQAEngine, ProviderQueryEmbedder
+from src.ingestion.embeddings import (
+    build_ingestion_embedding_clients,
+    build_query_embedding_clients,
+)
 from src.ingestion import (
     BestEffortParser,
     BestEffortTextExtractor,
-    HashingIngestionEmbedder,
     HybridVectorIndexStore,
     IngestionOrchestrator,
     InMemoryIndexBackend,
     IndexingError,
     ParentChildChunker,
+    ProviderIngestionEmbedder,
     UploadIntakeError,
     UploadIntakeService,
 )
@@ -35,6 +54,10 @@ from src.models.schemas import (
     IngestResponse,
     IngestionStatus,
     Mode,
+    StructuredExtractRequest,
+    StructuredExtractResponse,
+    StructuredFieldProvenance,
+    StructuredValidationDiagnostic,
     UploadBatchResponse,
 )
 
@@ -100,12 +123,12 @@ class ApiServices:
     cfg: Settings
     intake: UploadIntakeService
     index_store: HybridVectorIndexStore
+    index_readiness: dict[str, Any]
     local_qa: LocalQAEngine
     cloud_agent: CloudAgentEngine
+    state_store: ApiStateStore
+    structured_extractor: Tier4StructuredExtractor | None = None
     orchestrator: IngestionOrchestrator | None = None
-    idempotency_records: dict[str, IngestResponse] = field(default_factory=dict)
-    ingestion_records: dict[str, IngestResponse] = field(default_factory=dict)
-    idempotency_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 app = FastAPI(title=settings.project_name)
@@ -115,36 +138,146 @@ def get_app_settings() -> Settings:
     return settings
 
 
-def _build_default_services(cfg: Settings) -> ApiServices:
+def _build_state_store(cfg: Settings) -> ApiStateStore:
+    if cfg.api_state_backend == "memory":
+        return InMemoryApiStateStore(
+            idempotency_ttl_seconds=cfg.api_state_idempotency_ttl_seconds,
+            ingestion_ttl_seconds=cfg.api_state_ingestion_ttl_seconds,
+            session_ttl_seconds=cfg.api_state_session_ttl_seconds,
+            idempotency_claim_ttl_seconds=cfg.api_state_idempotency_claim_ttl_seconds,
+        )
+
+    try:
+        return RedisApiStateStore(
+            redis_url=cfg.redis_url,
+            key_prefix=cfg.api_state_key_prefix,
+            idempotency_ttl_seconds=cfg.api_state_idempotency_ttl_seconds,
+            ingestion_ttl_seconds=cfg.api_state_ingestion_ttl_seconds,
+            session_ttl_seconds=cfg.api_state_session_ttl_seconds,
+            idempotency_claim_ttl_seconds=cfg.api_state_idempotency_claim_ttl_seconds,
+        )
+    except ApiStateStoreError as exc:
+        if cfg.api_state_backend == "redis":
+            raise
+        logger.warning(
+            "Falling back to in-memory API state store: %s",
+            exc,
+        )
+        return InMemoryApiStateStore(
+            idempotency_ttl_seconds=cfg.api_state_idempotency_ttl_seconds,
+            ingestion_ttl_seconds=cfg.api_state_ingestion_ttl_seconds,
+            session_ttl_seconds=cfg.api_state_session_ttl_seconds,
+            idempotency_claim_ttl_seconds=cfg.api_state_idempotency_claim_ttl_seconds,
+        )
+    raise RuntimeError("unreachable state store configuration")
+
+
+def _index_fallback_allowed(cfg: Settings) -> bool:
+    return cfg.allow_in_memory_index_fallback and cfg.environment in {"local", "dev"}
+
+
+def _build_index_store(cfg: Settings) -> tuple[HybridVectorIndexStore, dict[str, Any]]:
+    fallback_allowed = _index_fallback_allowed(cfg)
+    logger.info(
+        "Connecting to Redis at %s (retries=%d)",
+        cfg.redis_url,
+        cfg.redis_connection_retries,
+    )
     try:
         index_store = HybridVectorIndexStore(cfg=cfg)
         index_store.bootstrap_indices()
-    except Exception as exc:  # pragma: no cover - runtime dependency fallback
+        logger.info("Redis index backend initialized successfully")
+        return index_store, {
+            "state": "ready",
+            "backend": type(index_store.backend).__name__,
+            "reason": "redis_ready",
+            "fallback_allowed": fallback_allowed,
+            "degraded": False,
+        }
+    except Exception as exc:
+        if not fallback_allowed:
+            raise RuntimeError(
+                "Redis index backend is unavailable and in-memory fallback is disabled. "
+                "Set ALLOW_IN_MEMORY_INDEX_FALLBACK=true only for local/dev troubleshooting."
+            ) from exc
+
         logger.warning(
-            "Falling back to in-memory index backend for API runtime: %s",
+            "Redis index backend unavailable; using in-memory fallback because "
+            "ALLOW_IN_MEMORY_INDEX_FALLBACK is enabled: %s",
             exc,
         )
         in_memory = InMemoryIndexBackend()
         index_store = HybridVectorIndexStore(cfg=cfg, backend=in_memory)
         index_store.bootstrap_indices()
+        return index_store, {
+            "state": "degraded",
+            "backend": type(index_store.backend).__name__,
+            "reason": "redis_unavailable_fallback_enabled",
+            "fallback_allowed": fallback_allowed,
+            "degraded": True,
+            "error": str(exc),
+        }
+
+
+def _build_default_services(cfg: Settings) -> ApiServices:
+    index_store, index_readiness = _build_index_store(cfg)
 
     extractor = BestEffortTextExtractor()
-    parser = BestEffortParser(fallback_extractor=extractor)
+    parser = BestEffortParser(
+        fallback_extractor=extractor,
+        docling_enabled=cfg.docling_enabled,
+        google_enabled=cfg.google_parser_enabled,
+        parser_order=_parser_order_for_mode(cfg.parser_routing_mode),
+    )
     chunker = ParentChildChunker()
-    embedder = HashingIngestionEmbedder()
+    tier1_embed_client, tier4_embed_client = build_ingestion_embedding_clients(cfg)
+    query_primary_client, query_fallback_client = build_query_embedding_clients(cfg)
+    embedder = ProviderIngestionEmbedder(
+        tier1_client=tier1_embed_client,
+        tier4_client=tier4_embed_client,
+    )
 
     model_client: CloudAgentModelClient
-    if cfg.cloud_agent_provider == "fallback":
+    if cfg.cloud_agent_provider == "gemini":
+        model_client = GeminiCloudModelClient(cfg=cfg)
+    elif cfg.cloud_agent_provider == "fallback":
         model_client = _FallbackCloudModelClient()
     else:
         model_client = _DisabledCloudModelClient()
+
+    provider_diag = _deep_provider_diagnostics(cfg)
+    if cfg.deep_mode_enabled and not provider_diag["ready"]:
+        logger.warning(
+            "Deep mode enabled but provider is not ready: %s",
+            provider_diag,
+        )
+    else:
+        logger.info("Deep provider diagnostics: %s", provider_diag)
+
+    _log_runtime_capabilities(cfg)
 
     return ApiServices(
         cfg=cfg,
         intake=UploadIntakeService(cfg),
         index_store=index_store,
-        local_qa=LocalQAEngine(index_store=index_store, cfg=cfg),
+        index_readiness=index_readiness,
+        local_qa=LocalQAEngine(
+            index_store=index_store,
+            cfg=cfg,
+            embedder=ProviderQueryEmbedder(
+                primary_client=query_primary_client,
+                fallback_client=query_fallback_client,
+            ),
+            query_vector_dimension=cfg.local_embedding_dimension,
+        ),
         cloud_agent=CloudAgentEngine(model_client=model_client, cfg=cfg),
+        state_store=_build_state_store(cfg),
+        structured_extractor=Tier4StructuredExtractor(
+            cfg=cfg,
+            max_input_tokens=cfg.extraction_max_input_tokens,
+            max_output_tokens=cfg.extraction_max_output_tokens,
+            strict_schema=cfg.extraction_strict_schema,
+        ),
         orchestrator=IngestionOrchestrator(
             extractor=extractor,
             parser=parser,
@@ -170,6 +303,17 @@ def ensure_runtime_dirs() -> None:
     settings.ensure_runtime_dirs()
     if not hasattr(app.state, "services"):
         app.state.services = _build_default_services(settings)
+
+
+@app.on_event("shutdown")
+async def close_runtime_services() -> None:
+    services = getattr(app.state, "services", None)
+    if services is None:
+        return
+    try:
+        await services.state_store.close()
+    except Exception:
+        logger.warning("Failed to close API state store cleanly", exc_info=True)
 
 
 @app.middleware("http")
@@ -210,14 +354,32 @@ async def validation_error_handler(
 @app.get("/healthz")
 def healthz(services: ApiServices = Depends(get_services)) -> dict[str, Any]:
     backend_name = type(services.index_store.backend).__name__
+    state_backend_name = type(services.state_store).__name__
+    readiness = _runtime_readiness_report(services)
     return {
         "status": "ok",
         "index_backend": backend_name,
+        "state_backend": state_backend_name,
+        "readiness": readiness,
         "orchestrator_configured": services.orchestrator is not None,
         "deep_mode_enabled": services.cfg.deep_mode_enabled,
         "cloud_agent_provider": services.cfg.cloud_agent_provider,
+        "parser_routing_mode": services.cfg.parser_routing_mode,
+        "deep_provider": _deep_provider_diagnostics(services.cfg),
         "dependencies": _runtime_dependency_report(),
+        "capabilities": _runtime_capabilities_report(services.cfg),
     }
+
+
+@app.get("/readyz")
+def readyz(
+    response: Response,
+    services: ApiServices = Depends(get_services),
+) -> dict[str, Any]:
+    readiness = _runtime_readiness_report(services)
+    if readiness["overall"] != "ready":
+        response.status_code = 503
+    return readiness
 
 
 @app.post("/ingest", response_model=IngestResponse, status_code=201)
@@ -240,11 +402,11 @@ async def ingest(
 
 
 @app.get("/ingest/{document_id}", response_model=IngestResponse)
-def get_ingest_status(
+async def get_ingest_status(
     document_id: str,
     services: ApiServices = Depends(get_services),
 ) -> IngestResponse:
-    record = services.ingestion_records.get(document_id)
+    record = await services.state_store.get_ingestion_record(document_id)
     if record is None:
         raise ApiError(
             code="document_not_found",
@@ -252,6 +414,130 @@ def get_ingest_status(
             status_code=404,
         )
     return record
+
+
+@app.post("/extract", response_model=StructuredExtractResponse)
+async def extract_structured_fields(
+    payload: StructuredExtractRequest,
+    services: ApiServices = Depends(get_services),
+) -> StructuredExtractResponse:
+    await _validate_document_ready(document_id=payload.document_id, services=services)
+    document_text = await _load_document_text_for_extraction(
+        document_id=payload.document_id,
+        services=services,
+    )
+
+    extractor = services.structured_extractor or Tier4StructuredExtractor(
+        cfg=services.cfg,
+        max_input_tokens=services.cfg.extraction_max_input_tokens,
+        max_output_tokens=services.cfg.extraction_max_output_tokens,
+        strict_schema=services.cfg.extraction_strict_schema,
+    )
+    envelope = await asyncio.to_thread(
+        extractor.extract_structured,
+        document_id=payload.document_id,
+        document_text=document_text,
+        schema=payload.schema,
+        prompt=payload.prompt,
+    )
+
+    if not envelope.ok or envelope.result is None:
+        error = envelope.error
+        if error is None:
+            raise ApiError(
+                code="structured_extraction_failed",
+                message="structured extraction failed unexpectedly",
+                status_code=500,
+            )
+        status_map = {
+            "invalid_schema": 422,
+            "token_budget_exceeded": 422,
+            "provider_error": 503,
+            "provider_disabled": 503,
+            "validation_failed": 422,
+        }
+        raise ApiError(
+            code=error.code,
+            message=error.message,
+            status_code=status_map.get(error.code, 500),
+            details={
+                "diagnostics": [
+                    {
+                        "code": item.code,
+                        "message": item.message,
+                        "field": item.field,
+                        "details": item.details,
+                    }
+                    for item in error.diagnostics
+                ],
+                "token_usage": error.token_usage,
+                "latency_ms": error.latency_ms,
+            },
+        )
+
+    artifact_path = _persist_extraction_artifact(
+        document_id=payload.document_id,
+        prompt=payload.prompt,
+        schema=payload.schema,
+        response=StructuredExtractResponse(
+            document_id=envelope.result.document_id,
+            model=envelope.result.model,
+            prompt_version=envelope.result.prompt_version,
+            data=envelope.result.data,
+            provenance={
+                key: StructuredFieldProvenance(
+                    start_offset=value.start_offset,
+                    end_offset=value.end_offset,
+                    text=value.text,
+                )
+                for key, value in envelope.result.provenance.items()
+            },
+            accepted_fields=envelope.result.accepted_fields,
+            rejected_fields=envelope.result.rejected_fields,
+            diagnostics=[
+                StructuredValidationDiagnostic(
+                    code=item.code,
+                    message=item.message,
+                    field=item.field,
+                    details=item.details,
+                )
+                for item in envelope.result.diagnostics
+            ],
+            token_usage=envelope.result.token_usage,
+            latency_ms=envelope.result.latency_ms,
+            artifact_path="pending",
+        ),
+        cfg=services.cfg,
+    )
+
+    return StructuredExtractResponse(
+        document_id=envelope.result.document_id,
+        model=envelope.result.model,
+        prompt_version=envelope.result.prompt_version,
+        data=envelope.result.data,
+        provenance={
+            key: StructuredFieldProvenance(
+                start_offset=value.start_offset,
+                end_offset=value.end_offset,
+                text=value.text,
+            )
+            for key, value in envelope.result.provenance.items()
+        },
+        accepted_fields=envelope.result.accepted_fields,
+        rejected_fields=envelope.result.rejected_fields,
+        diagnostics=[
+            StructuredValidationDiagnostic(
+                code=item.code,
+                message=item.message,
+                field=item.field,
+                details=item.details,
+            )
+            for item in envelope.result.diagnostics
+        ],
+        token_usage=envelope.result.token_usage,
+        latency_ms=envelope.result.latency_ms,
+        artifact_path=artifact_path,
+    )
 
 
 @app.post(
@@ -308,28 +594,51 @@ async def _ingest_upload(
     idempotency_key: str | None,
     services: ApiServices,
 ) -> tuple[IngestResponse, bool]:
+    claim_acquired = False
     try:
         if idempotency_key:
-            async with services.idempotency_lock:
-                replay = services.idempotency_records.get(idempotency_key)
-                if replay is not None:
-                    await upload.close()
-                    return replay, True
+            replay = await services.state_store.get_idempotency_response(
+                idempotency_key
+            )
+            if replay is not None:
+                await upload.close()
+                return replay, True
 
-                receipt = await _save_upload_with_timeout(
-                    intake=services.intake,
-                    upload=upload,
-                    timeout_seconds=services.cfg.ingest_timeout_seconds,
-                )
-                ingest_response = await _build_ingest_response_for_receipt(
-                    receipt=receipt,
+            claim_acquired = await services.state_store.claim_idempotency_key(
+                idempotency_key
+            )
+            if not claim_acquired:
+                replay = await _wait_for_idempotency_replay(
                     services=services,
-                    mime_type=_normalize_upload_mime(
-                        upload, receipt_file_path=str(receipt.file_path)
-                    ),
+                    idempotency_key=idempotency_key,
                 )
-                services.idempotency_records[idempotency_key] = ingest_response
-                return ingest_response, False
+                await upload.close()
+                if replay is not None:
+                    return replay, True
+                raise ApiError(
+                    code="idempotency_conflict",
+                    message="request with the same Idempotency-Key is in progress",
+                    status_code=409,
+                )
+
+            receipt = await _save_upload_with_timeout(
+                intake=services.intake,
+                upload=upload,
+                timeout_seconds=services.cfg.ingest_timeout_seconds,
+            )
+            ingest_response = await _build_ingest_response_for_receipt(
+                receipt=receipt,
+                services=services,
+                mime_type=_normalize_upload_mime(
+                    upload, receipt_file_path=str(receipt.file_path)
+                ),
+            )
+            await services.state_store.put_idempotency_response(
+                idempotency_key,
+                ingest_response,
+            )
+            claim_acquired = False
+            return ingest_response, False
 
         receipt = await _save_upload_with_timeout(
             intake=services.intake,
@@ -359,6 +668,26 @@ async def _ingest_upload(
             status_code=500,
             details={"error": str(exc)},
         ) from exc
+    finally:
+        if idempotency_key and claim_acquired:
+            await services.state_store.release_idempotency_key(idempotency_key)
+
+
+async def _wait_for_idempotency_replay(
+    *,
+    services: ApiServices,
+    idempotency_key: str,
+) -> IngestResponse | None:
+    deadline = time.monotonic() + min(
+        float(services.cfg.request_timeout_seconds),
+        float(services.cfg.api_state_idempotency_claim_ttl_seconds),
+    )
+    while time.monotonic() < deadline:
+        replay = await services.state_store.get_idempotency_response(idempotency_key)
+        if replay is not None:
+            return replay
+        await asyncio.sleep(0.05)
+    return None
 
 
 async def _build_ingest_response_for_receipt(
@@ -372,7 +701,7 @@ async def _build_ingest_response_for_receipt(
             document_id=receipt.document_id,
             file_path=str(receipt.file_path),
         )
-        services.ingestion_records[receipt.document_id] = response
+        await services.state_store.put_ingestion_record(response)
         return response
 
     record = await _run_orchestration_with_timeout(
@@ -388,7 +717,7 @@ async def _build_ingest_response_for_receipt(
         status=record.status,
         message=message,
     )
-    services.ingestion_records[receipt.document_id] = response
+    await services.state_store.put_ingestion_record(response)
     return response
 
 
@@ -398,7 +727,16 @@ async def ask(
     services: ApiServices = Depends(get_services),
 ) -> ChatResponse:
     try:
-        _validate_document_ready(document_id=payload.document_id, services=services)
+        await _validate_document_ready(
+            document_id=payload.document_id, services=services
+        )
+        chat_history = await _read_session_history(
+            services=services,
+            session_id=payload.session_id,
+            document_id=payload.document_id,
+        )
+
+        response: ChatResponse
 
         if payload.mode == Mode.DEEP:
             if not services.cfg.deep_mode_enabled:
@@ -408,7 +746,7 @@ async def ask(
                     status_code=503,
                     details={"cloud_agent_provider": services.cfg.cloud_agent_provider},
                 )
-            return await _ask_with_timeout(
+            response = await _ask_with_timeout(
                 handler=lambda: services.cloud_agent.ask(
                     question=payload.question,
                     mode=payload.mode,
@@ -416,14 +754,125 @@ async def ask(
                 ),
                 timeout_seconds=services.cfg.request_timeout_seconds,
             )
+            _raise_if_deep_provider_failed(response)
+        else:
+            response = await _ask_with_timeout(
+                handler=lambda: services.local_qa.ask(
+                    question=payload.question,
+                    mode=payload.mode,
+                    document_id=payload.document_id,
+                    chat_history=chat_history,
+                ),
+                timeout_seconds=services.cfg.request_timeout_seconds,
+            )
 
-        return await _ask_with_timeout(
-            handler=lambda: services.local_qa.ask(
+        await _record_session_turn(
+            services=services,
+            session_id=payload.session_id,
+            document_id=payload.document_id,
+            question=payload.question,
+            answer=response.answer,
+        )
+        return response
+    except IndexingError as exc:
+        raise ApiError(
+            code="retrieval_unavailable",
+            message="retrieval backend is unavailable",
+            status_code=503,
+            details={"error": str(exc)},
+        ) from exc
+    except ApiError:
+        raise
+    except Exception as exc:
+        raise ApiError(
+            code="ask_failed",
+            message="ask request failed unexpectedly",
+            status_code=500,
+            details={"error": str(exc)},
+        ) from exc
+
+
+@app.post("/ask/stream")
+async def ask_stream(
+    payload: ChatRequest,
+    services: ApiServices = Depends(get_services),
+) -> StreamingResponse:
+    try:
+        await _validate_document_ready(
+            document_id=payload.document_id, services=services
+        )
+        chat_history = await _read_session_history(
+            services=services,
+            session_id=payload.session_id,
+            document_id=payload.document_id,
+        )
+
+        if payload.mode == Mode.DEEP:
+            if not services.cfg.deep_mode_enabled:
+                raise ApiError(
+                    code="deep_mode_disabled",
+                    message="deep mode is disabled in this deployment",
+                    status_code=503,
+                    details={"cloud_agent_provider": services.cfg.cloud_agent_provider},
+                )
+            response = await _ask_with_timeout(
+                handler=lambda: services.cloud_agent.ask(
+                    question=payload.question,
+                    mode=payload.mode,
+                    document_id=payload.document_id,
+                ),
+                timeout_seconds=services.cfg.request_timeout_seconds,
+            )
+            _raise_if_deep_provider_failed(response)
+            events = _single_response_events(response)
+        else:
+            events = services.local_qa.ask_stream_events(
                 question=payload.question,
                 mode=payload.mode,
                 document_id=payload.document_id,
-            ),
-            timeout_seconds=services.cfg.request_timeout_seconds,
+                chat_history=chat_history,
+            )
+
+        async def stream_body() -> AsyncIterator[bytes]:
+            streamed_tokens: list[str] = []
+            final_answer: str | None = None
+
+            async for event in iterate_in_threadpool(events):
+                if not isinstance(event, dict):
+                    continue
+
+                event_type = str(event.get("type", "")).strip().lower()
+                if event_type == "token":
+                    delta = str(event.get("delta", ""))
+                    if delta:
+                        streamed_tokens.append(delta)
+                elif event_type == "final":
+                    response_payload = event.get("response")
+                    if isinstance(response_payload, dict):
+                        answer = str(response_payload.get("answer", "")).strip()
+                        if answer:
+                            final_answer = answer
+
+                yield _serialize_stream_event(event)
+
+            if final_answer is None:
+                joined = "".join(streamed_tokens).strip()
+                if joined:
+                    final_answer = joined
+
+            if final_answer:
+                await _record_session_turn(
+                    services=services,
+                    session_id=payload.session_id,
+                    document_id=payload.document_id,
+                    question=payload.question,
+                    answer=final_answer,
+                )
+
+        return StreamingResponse(
+            stream_body(),
+            media_type="application/x-ndjson",
+            headers={"Cache-Control": "no-cache"},
         )
     except IndexingError as exc:
         raise ApiError(
@@ -532,6 +981,32 @@ async def _ask_with_timeout(*, handler: Any, timeout_seconds: int) -> ChatRespon
         ) from exc
 
 
+def _single_response_events(response: ChatResponse) -> Any:
+    yield {
+        "type": "status",
+        "phase": "generation",
+        "message": "Generating deep-mode response...",
+    }
+    for delta in _chunk_stream_text(response.answer, chunk_size=8):
+        yield {"type": "token", "delta": delta}
+    yield {"type": "final", "response": response.model_dump(mode="json")}
+
+
+def _chunk_stream_text(text: str, *, chunk_size: int) -> Any:
+    if chunk_size <= 0:
+        raise ValueError("chunk_size must be positive")
+    if not text:
+        return
+    for start in range(0, len(text), chunk_size):
+        delta = text[start : start + chunk_size]
+        if delta:
+            yield delta
+
+
+def _serialize_stream_event(event: dict[str, Any]) -> bytes:
+    return (json.dumps(event, ensure_ascii=False) + "\n").encode("utf-8")
+
+
 def _build_error_response(
     *,
     request: Request,
@@ -552,6 +1027,31 @@ def _build_error_response(
     if correlation_id:
         response.headers["x-correlation-id"] = correlation_id
     return response
+
+
+def _raise_if_deep_provider_failed(response: ChatResponse) -> None:
+    termination_reason = response.trace.termination_reason if response.trace else None
+    if not termination_reason:
+        return
+
+    status_by_code = {
+        DeepProviderErrorCode.NOT_CONFIGURED.value: 503,
+        DeepProviderErrorCode.AUTHENTICATION_FAILED.value: 503,
+        DeepProviderErrorCode.RATE_LIMITED.value: 429,
+        DeepProviderErrorCode.TIMEOUT.value: 504,
+        DeepProviderErrorCode.UNAVAILABLE.value: 503,
+        DeepProviderErrorCode.MALFORMED_RESPONSE.value: 502,
+    }
+    status_code = status_by_code.get(termination_reason)
+    if status_code is None:
+        return
+
+    raise ApiError(
+        code=termination_reason,
+        message="deep mode provider request failed",
+        status_code=status_code,
+        details={"provider_message": response.answer},
+    )
 
 
 def _normalize_upload_inputs(
@@ -601,13 +1101,15 @@ def _ingestion_status_message(
     return "queued for processing"
 
 
-def _validate_document_ready(*, document_id: str | None, services: ApiServices) -> None:
+async def _validate_document_ready(
+    *, document_id: str | None, services: ApiServices
+) -> None:
     if not document_id:
         return
     if services.orchestrator is None:
         return
 
-    ingest = services.ingestion_records.get(document_id)
+    ingest = await services.state_store.get_ingestion_record(document_id)
     if ingest is None:
         return
 
@@ -622,6 +1124,73 @@ def _validate_document_ready(*, document_id: str | None, services: ApiServices) 
     )
 
 
+async def _load_document_text_for_extraction(
+    *,
+    document_id: str,
+    services: ApiServices,
+) -> str:
+    record = await services.state_store.get_ingestion_record(document_id)
+    if record is None:
+        raise ApiError(
+            code="document_not_found",
+            message=f"document not found: {document_id}",
+            status_code=404,
+        )
+
+    file_path = Path(record.file_path)
+    if not file_path.exists():
+        raise ApiError(
+            code="document_file_missing",
+            message="stored document file is missing on disk",
+            status_code=404,
+            details={"document_id": document_id, "file_path": str(file_path)},
+        )
+
+    mime_type = mimetypes.guess_type(str(file_path))[0] or "application/octet-stream"
+    extractor = BestEffortTextExtractor()
+    extraction = await asyncio.to_thread(
+        extractor.extract,
+        file_path=file_path,
+        mime_type=mime_type,
+    )
+    document_text = extraction.text.strip()
+    if not document_text:
+        raise ApiError(
+            code="document_text_unavailable",
+            message="document did not produce extractable text",
+            status_code=422,
+            details={"document_id": document_id},
+        )
+    return document_text
+
+
+def _persist_extraction_artifact(
+    *,
+    document_id: str,
+    prompt: str | None,
+    schema: dict[str, Any],
+    response: StructuredExtractResponse,
+    cfg: Settings,
+) -> str:
+    artifact_dir = cfg.parsed_dir / "extractions"
+    artifact_dir.mkdir(parents=True, exist_ok=True)
+    artifact_path = artifact_dir / f"{document_id}_{uuid4().hex}.json"
+    response_payload = response.model_dump(mode="json")
+    response_payload["artifact_path"] = str(artifact_path)
+
+    payload = {
+        "document_id": document_id,
+        "prompt": prompt,
+        "schema": schema,
+        "response": response_payload,
+    }
+    artifact_path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return str(artifact_path)
+
+
 def _runtime_dependency_report() -> dict[str, bool]:
     modules = {
         "redisvl": "redisvl",
@@ -629,8 +1198,194 @@ def _runtime_dependency_report() -> dict[str, bool]:
         "pillow": "PIL",
         "pytesseract": "pytesseract",
         "docling": "docling",
+        "langextract": "langextract",
     }
     return {
         label: importlib.util.find_spec(module_name) is not None
         for label, module_name in modules.items()
     }
+
+
+def _runtime_capabilities_report(cfg: Settings) -> dict[str, dict[str, Any]]:
+    return {
+        "docling_parser": _optional_capability_status(
+            enabled=cfg.docling_enabled,
+            module_name="docling",
+            package_name="docling",
+        ),
+        "google_parser": _google_parser_capability_status(cfg),
+        "langextract_extractor": _optional_capability_status(
+            enabled=cfg.langextract_enabled,
+            module_name="langextract",
+            package_name="langextract",
+        ),
+    }
+
+
+def _optional_capability_status(
+    *,
+    enabled: bool,
+    module_name: str,
+    package_name: str,
+) -> dict[str, Any]:
+    if not enabled:
+        return {
+            "enabled": False,
+            "ready": False,
+            "reason": "disabled_by_config",
+            "hint": f"set {module_name.upper()}_ENABLED=true to enable",
+        }
+
+    dependency_available = importlib.util.find_spec(module_name) is not None
+    if dependency_available:
+        return {
+            "enabled": True,
+            "ready": True,
+            "reason": "ready",
+            "hint": None,
+        }
+
+    return {
+        "enabled": True,
+        "ready": False,
+        "reason": "missing_dependency",
+        "hint": (
+            f"install optional runtime dependencies: pip install -e .[ai] "
+            f"(missing package: {package_name})"
+        ),
+    }
+
+
+def _log_runtime_capabilities(cfg: Settings) -> None:
+    capabilities = _runtime_capabilities_report(cfg)
+    for name, report in capabilities.items():
+        level = (
+            logger.warning if report["enabled"] and not report["ready"] else logger.info
+        )
+        level(
+            "Runtime capability %s => enabled=%s ready=%s reason=%s hint=%s",
+            name,
+            report["enabled"],
+            report["ready"],
+            report["reason"],
+            report["hint"],
+        )
+
+
+def _google_parser_capability_status(cfg: Settings) -> dict[str, Any]:
+    if not cfg.google_parser_enabled:
+        return {
+            "enabled": False,
+            "ready": False,
+            "reason": "disabled_by_config",
+            "hint": "set GOOGLE_PARSER_ENABLED=true to enable",
+        }
+
+    api_key_present = bool((cfg.cloud_agent_api_key or "").strip())
+    if api_key_present:
+        return {
+            "enabled": True,
+            "ready": True,
+            "reason": "ready",
+            "hint": None,
+        }
+    return {
+        "enabled": True,
+        "ready": False,
+        "reason": "missing_api_key",
+        "hint": "set CLOUD_AGENT_API_KEY for Google parser routing",
+    }
+
+
+def _parser_order_for_mode(mode: str) -> tuple[str, ...]:
+    mapping: dict[str, tuple[str, ...]] = {
+        "docling_google_fallback": ("docling", "google", "fallback"),
+        "google_docling_fallback": ("google", "docling", "fallback"),
+        "docling_fallback": ("docling", "fallback"),
+        "google_fallback": ("google", "fallback"),
+        "fallback_only": ("fallback",),
+    }
+    return mapping.get(mode, ("docling", "google", "fallback"))
+
+
+def _runtime_readiness_report(services: ApiServices) -> dict[str, Any]:
+    index = dict(services.index_readiness)
+    overall = "degraded" if bool(index.get("degraded")) else "ready"
+    return {
+        "overall": overall,
+        "environment": services.cfg.environment,
+        "index": index,
+    }
+
+
+def _deep_provider_diagnostics(cfg: Settings) -> dict[str, Any]:
+    provider = cfg.cloud_agent_provider
+    if provider == "disabled":
+        return {
+            "provider": provider,
+            "ready": False,
+            "reason": "provider_disabled",
+        }
+    if provider == "fallback":
+        return {
+            "provider": provider,
+            "ready": False,
+            "reason": "fallback_provider",
+        }
+
+    api_key_present = bool((cfg.cloud_agent_api_key or "").strip())
+    return {
+        "provider": provider,
+        "ready": api_key_present,
+        "reason": "ready" if api_key_present else "missing_api_key",
+        "model": cfg.cloud_agent_model,
+        "timeout_seconds": cfg.cloud_agent_timeout_seconds,
+        "retry_attempts": cfg.cloud_agent_retry_attempts,
+    }
+
+
+async def _read_session_history(
+    *,
+    services: ApiServices,
+    session_id: str | None,
+    document_id: str | None,
+) -> list[dict[str, str]]:
+    key = _session_history_key(session_id=session_id, document_id=document_id)
+    if key is None:
+        return []
+    return await services.state_store.get_session_history(key)
+
+
+async def _record_session_turn(
+    *,
+    services: ApiServices,
+    session_id: str | None,
+    document_id: str | None,
+    question: str,
+    answer: str,
+) -> None:
+    key = _session_history_key(session_id=session_id, document_id=document_id)
+    clean_question = question.strip()
+    clean_answer = answer.strip()
+    if key is None or not clean_question or not clean_answer:
+        return
+    await services.state_store.append_session_turn(
+        key=key,
+        question=clean_question,
+        answer=clean_answer,
+        max_turns=services.cfg.api_state_session_max_turns,
+    )
+
+
+def _session_history_key(
+    *, session_id: str | None, document_id: str | None
+) -> str | None:
+    if session_id is None:
+        return None
+
+    normalized_session_id = session_id.strip()
+    if not normalized_session_id:
+        return None
+
+    normalized_document_id = document_id.strip() if document_id else "*"
+    return f"{normalized_session_id}::{normalized_document_id}"

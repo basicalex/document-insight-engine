@@ -30,6 +30,7 @@ from src.ingestion.parsing import (
     ParsedMarkdownDocument,
     Tier2DoclingParser,
 )
+from src.ingestion.google_parser import GoogleParserError, Tier2GoogleParser
 from src.ingestion.orchestration import (
     EmbeddingBundle,
     IngestionEvent,
@@ -43,6 +44,18 @@ from src.ingestion.runtime_pipeline import (
     BestEffortParser,
     BestEffortTextExtractor,
     HashingIngestionEmbedder,
+    ProviderIngestionEmbedder,
+)
+from src.ingestion.embeddings import (
+    EmbeddingProviderError,
+    FallbackEmbeddingClient,
+    GeminiEmbeddingClient,
+    HashingEmbeddingClient,
+    OllamaEmbeddingClient,
+    TextEmbedding,
+    TextEmbeddingClient,
+    build_ingestion_embedding_clients,
+    build_query_embedding_clients,
 )
 from src.ingestion.vectorize import hashing_vector, tokenize_words
 
@@ -80,7 +93,19 @@ __all__ = [
     "UploadIntakeService",
     "BestEffortParser",
     "BestEffortTextExtractor",
+    "EmbeddingProviderError",
+    "FallbackEmbeddingClient",
+    "GeminiEmbeddingClient",
     "HashingIngestionEmbedder",
+    "HashingEmbeddingClient",
+    "GoogleParserError",
+    "OllamaEmbeddingClient",
+    "ProviderIngestionEmbedder",
+    "Tier2GoogleParser",
+    "TextEmbedding",
+    "TextEmbeddingClient",
+    "build_ingestion_embedding_clients",
+    "build_query_embedding_clients",
     "hashing_vector",
     "tokenize_words",
 ]

@@ -92,6 +92,39 @@ class UploadBatchResponse(BaseModel):
     count: int = Field(ge=0)
 
 
+class StructuredExtractRequest(BaseModel):
+    document_id: str = Field(min_length=1)
+    schema: dict[str, Any]
+    prompt: str | None = None
+
+
+class StructuredFieldProvenance(BaseModel):
+    start_offset: int = Field(ge=0)
+    end_offset: int = Field(ge=0)
+    text: str
+
+
+class StructuredValidationDiagnostic(BaseModel):
+    code: str = Field(min_length=1)
+    message: str = Field(min_length=1)
+    field: str | None = None
+    details: dict[str, Any] = Field(default_factory=dict)
+
+
+class StructuredExtractResponse(BaseModel):
+    document_id: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    prompt_version: str = Field(min_length=1)
+    data: dict[str, Any] = Field(default_factory=dict)
+    provenance: dict[str, StructuredFieldProvenance] = Field(default_factory=dict)
+    accepted_fields: list[str] = Field(default_factory=list)
+    rejected_fields: list[str] = Field(default_factory=list)
+    diagnostics: list[StructuredValidationDiagnostic] = Field(default_factory=list)
+    token_usage: dict[str, int] = Field(default_factory=dict)
+    latency_ms: int = Field(ge=0)
+    artifact_path: str = Field(min_length=1)
+
+
 class ErrorEnvelope(BaseModel):
     model_config = ConfigDict(extra="allow")
 

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, MutableMapping
 
 
@@ -8,7 +9,10 @@ DEFAULT_API_BASE_URL = "http://localhost:8000"
 
 
 def initialize_session_state(state: MutableMapping[str, Any]) -> None:
-    state.setdefault("api_base_url", DEFAULT_API_BASE_URL)
+    state.setdefault(
+        "api_base_url",
+        os.getenv("DOCUMENT_INSIGHT_API_BASE_URL", DEFAULT_API_BASE_URL),
+    )
     state.setdefault("chat_mode", "fast")
     state.setdefault("active_document_id", "")
     state.setdefault("session_id", "")

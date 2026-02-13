@@ -1,10 +1,15 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Iterator
 
 from src.config.settings import Settings
-from src.engine.local_llm import LocalQAEngine, RetrievedEvidence, build_rag_prompt
+from src.engine.local_llm import (
+    LocalQAEngine,
+    QueryEmbeddingCandidate,
+    RetrievedEvidence,
+    build_rag_prompt,
+)
 from src.ingestion.indexing import QueryMatch
 from src.models.schemas import Mode
 
@@ -30,6 +35,58 @@ class StubEmbedder:
         return [0.1 for _ in range(dimension)]
 
 
+class CandidateEmbedder:
+    def embed_query_candidates(
+        self,
+        *,
+        text: str,
+        dimension: int,
+    ) -> list[QueryEmbeddingCandidate]:
+        del text
+        return [
+            QueryEmbeddingCandidate(
+                vector=[0.1 for _ in range(dimension)],
+                embedding_provider="ollama",
+                embedding_model="all-minilm",
+                embedding_version="ollama:all-minilm:v1",
+            ),
+            QueryEmbeddingCandidate(
+                vector=[0.2 for _ in range(dimension)],
+                embedding_provider="hash",
+                embedding_model="hash:all-minilm",
+                embedding_version="hash-v1",
+            ),
+        ]
+
+
+class SelectiveStore:
+    def __init__(self) -> None:
+        self.filter_calls: list[dict[str, Any] | None] = []
+
+    def query(
+        self,
+        tier: object,
+        vector: list[float],
+        top_k: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[QueryMatch]:
+        del tier, vector, top_k
+        self.filter_calls.append(filters)
+        if filters and filters.get("embedding_provider") == "hash":
+            return [
+                QueryMatch(
+                    record_id="rec-hash",
+                    score=0.9,
+                    payload={
+                        "chunk_id": "chunk-hash",
+                        "text": "Legacy hash embedding chunk.",
+                        "page_refs": ["1"],
+                    },
+                )
+            ]
+        return []
+
+
 @dataclass
 class StubOllama:
     answer: str
@@ -38,6 +95,16 @@ class StubOllama:
     def generate(self, *, model: str, prompt: str, timeout_seconds: int) -> str:
         self.prompt_seen = prompt
         return self.answer
+
+    def generate_stream(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        timeout_seconds: int,
+    ) -> Iterator[str]:
+        self.prompt_seen = prompt
+        yield self.answer
 
 
 def test_build_rag_prompt_includes_question_and_chunk_context() -> None:
@@ -59,6 +126,32 @@ def test_build_rag_prompt_includes_question_and_chunk_context() -> None:
     assert "Question:" in prompt
     assert "chunk-42" in prompt
     assert "INSUFFICIENT_EVIDENCE" in prompt
+
+
+def test_build_rag_prompt_includes_recent_chat_history() -> None:
+    prompt = build_rag_prompt(
+        question="And what is the due date?",
+        mode=Mode.FAST,
+        prompt_version="local-rag-v1",
+        evidence=[
+            RetrievedEvidence(
+                chunk_id="chunk-10",
+                text="Due date is 2026-01-30.",
+                page_refs=[1],
+                score=0.9,
+            )
+        ],
+        chat_history=[
+            {
+                "question": "What is this document?",
+                "answer": "It is an invoice.",
+            }
+        ],
+    )
+
+    assert "Conversation history" in prompt
+    assert "User: What is this document?" in prompt
+    assert "Assistant: It is an invoice." in prompt
 
 
 def test_local_engine_returns_insufficient_evidence_when_no_chunks_found() -> None:
@@ -114,9 +207,104 @@ def test_local_engine_returns_grounded_response_with_trace_and_citations() -> No
     assert response.insufficient_evidence is False
     assert response.answer == "Total due is 1234 USD."
     assert response.citations[0].chunk_id == "chunk-42"
+    assert response.citations[0].start_offset == 0
+    assert response.citations[0].end_offset is not None
     assert response.trace is not None
     assert response.trace.retrieved_chunk_ids == ["chunk-42"]
     assert response.trace.prompt_version == "local-rag-v1"
     assert response.trace.termination_reason == "completed"
     assert store.last_filters == {"document_id": "doc-123"}
     assert "chunk-42" in ollama.prompt_seen
+
+
+def test_local_engine_parses_json_encoded_page_refs_for_citations() -> None:
+    store = StubStore(
+        matches=[
+            QueryMatch(
+                record_id="rec-1",
+                score=0.95,
+                payload={
+                    "chunk_id": "chunk-42",
+                    "text": "Invoice states: Total due is 1234 USD.",
+                    "page_refs": '["3", "4"]',
+                    "document_id": "doc-123",
+                },
+            )
+        ]
+    )
+    engine = LocalQAEngine(
+        index_store=store,
+        cfg=Settings(),
+        embedder=StubEmbedder(),
+        ollama_client=StubOllama(answer="Total due is 1234 USD."),
+    )
+
+    response = engine.ask(
+        question="What is the total due?",
+        mode=Mode.FAST,
+        document_id="doc-123",
+    )
+
+    assert response.citations[0].page == 3
+
+
+def test_local_engine_stream_events_emit_tokens_and_final_payload() -> None:
+    store = StubStore(
+        matches=[
+            QueryMatch(
+                record_id="rec-1",
+                score=0.95,
+                payload={
+                    "chunk_id": "chunk-42",
+                    "text": "Invoice states: Total due is 1234 USD.",
+                    "page_refs": ["1"],
+                    "document_id": "doc-123",
+                },
+            )
+        ]
+    )
+    engine = LocalQAEngine(
+        index_store=store,
+        cfg=Settings(),
+        embedder=StubEmbedder(),
+        ollama_client=StubOllama(answer="Total due is 1234 USD."),
+    )
+
+    events = list(
+        engine.ask_stream_events(
+            question="What is the total due?",
+            mode=Mode.FAST,
+            document_id="doc-123",
+        )
+    )
+
+    assert len(events) == 4
+    assert events[0]["type"] == "status"
+    assert events[1]["type"] == "status"
+    assert events[2]["type"] == "token"
+    assert events[2]["delta"] == "Total due is 1234 USD."
+    assert events[3]["type"] == "final"
+    assert events[3]["response"]["answer"] == "Total due is 1234 USD."
+
+
+def test_local_engine_query_candidate_fallback_supports_migration_path() -> None:
+    store = SelectiveStore()
+    engine = LocalQAEngine(
+        index_store=store,
+        cfg=Settings(embedding_filter_strict=True),
+        embedder=CandidateEmbedder(),
+        ollama_client=StubOllama(answer="Found in legacy index."),
+    )
+
+    response = engine.ask(
+        question="What is the legacy answer?",
+        mode=Mode.FAST,
+        document_id="doc-legacy",
+    )
+
+    assert response.insufficient_evidence is False
+    assert response.answer == "Found in legacy index."
+    assert store.filter_calls[0] is not None
+    assert store.filter_calls[0]["embedding_provider"] == "ollama"
+    assert store.filter_calls[1] is not None
+    assert store.filter_calls[1]["embedding_provider"] == "hash"

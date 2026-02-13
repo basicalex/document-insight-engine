@@ -161,6 +161,7 @@ def _build_child_chunks(
 
     full_text = _join_block_text(parent_blocks)
     tokens = _tokenize(full_text)
+    block_token_spans = _block_token_spans(parent_blocks)
     if len(tokens) <= child_token_target:
         return [
             _create_child_chunk(
@@ -169,7 +170,12 @@ def _build_child_chunks(
                 order=1,
                 text=full_text,
                 section_path=parent_blocks[-1].section_path,
-                page_refs=_collect_page_refs(parent_blocks),
+                page_refs=_page_refs_for_window(
+                    block_spans=block_token_spans,
+                    start=0,
+                    end=len(tokens),
+                )
+                or _collect_page_refs(parent_blocks),
                 block_ids=[block.block_id for block in parent_blocks],
             )
         ]
@@ -190,7 +196,12 @@ def _build_child_chunks(
                 order=order,
                 text=child_text,
                 section_path=parent_blocks[-1].section_path,
-                page_refs=_collect_page_refs(parent_blocks),
+                page_refs=_page_refs_for_window(
+                    block_spans=block_token_spans,
+                    start=start,
+                    end=end,
+                )
+                or _collect_page_refs(parent_blocks),
                 block_ids=[block.block_id for block in parent_blocks],
             )
         )
@@ -235,6 +246,43 @@ def _create_child_chunk(
 def _collect_page_refs(blocks: list[ParsedBlock]) -> list[int]:
     refs = {block.page_number for block in blocks if block.page_number is not None}
     return sorted(refs)
+
+
+def _block_token_spans(blocks: list[ParsedBlock]) -> list[tuple[int, int, int | None]]:
+    spans: list[tuple[int, int, int | None]] = []
+    cursor = 0
+    for block in blocks:
+        count = _count_tokens(block.markdown)
+        start = cursor
+        end = cursor + count
+        spans.append((start, end, block.page_number))
+        cursor = end
+    return spans
+
+
+def _page_refs_for_window(
+    *, block_spans: list[tuple[int, int, int | None]], start: int, end: int
+) -> list[int]:
+    if end <= start:
+        return []
+
+    coverage_by_page: dict[int, int] = {}
+    for block_start, block_end, page_number in block_spans:
+        if page_number is None:
+            continue
+        overlap = max(0, min(end, block_end) - max(start, block_start))
+        if overlap <= 0:
+            continue
+        coverage_by_page[page_number] = coverage_by_page.get(page_number, 0) + overlap
+
+    if not coverage_by_page:
+        return []
+
+    ordered_pages = sorted(
+        coverage_by_page.items(),
+        key=lambda item: (-item[1], item[0]),
+    )
+    return [page for page, _ in ordered_pages]
 
 
 def _chunk_id(prefix: str, document_id: str, order: int, text: str) -> str:

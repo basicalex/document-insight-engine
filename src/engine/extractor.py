@@ -140,6 +140,15 @@ class Tier4StructuredExtractor:
         prompt: str | None = None,
     ) -> StructuredExtractionEnvelope:
         started = time.perf_counter()
+        if not self.cfg.langextract_enabled:
+            return self._error(
+                code="provider_disabled",
+                message="LangExtract provider is disabled by configuration",
+                diagnostics=[],
+                token_usage={"input_estimate": 0, "output_estimate": 0, "total": 0},
+                started=started,
+            )
+
         schema_error = _validate_schema_contract(schema)
         if schema_error is not None:
             return self._error(

@@ -56,7 +56,8 @@ def test_chunker_preserves_order_and_lineage_metadata() -> None:
     assert [parent.order for parent in result.parent_chunks] == [1]
     assert all(child.order >= 1 for child in result.child_chunks)
     assert all(child.section_path == ("Header",) for child in result.child_chunks)
-    assert all(child.page_refs == [1, 2] for child in result.child_chunks)
+    assert result.child_chunks[0].page_refs == [2, 1]
+    assert result.child_chunks[1].page_refs == [2]
 
 
 def test_chunker_keeps_table_blocks_atomic_for_children() -> None:

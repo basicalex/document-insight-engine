@@ -1,10 +1,17 @@
 from __future__ import annotations
 
+import json
+import logging
+import socket
+import time
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 from src.config.settings import Settings
+
+
+logger = logging.getLogger(__name__)
 
 
 class EmbeddingTier(str, Enum):
@@ -42,6 +49,8 @@ class IndexRecord:
     section_path: tuple[str, ...] = ()
     page_refs: list[int] = field(default_factory=list)
     embedding_version: str = "v1"
+    embedding_provider: str | None = None
+    embedding_model: str | None = None
 
 
 @dataclass(frozen=True)
@@ -53,6 +62,66 @@ class QueryMatch:
 
 class IndexingError(Exception):
     pass
+
+
+def _retry_redis_operation(
+    operation: Callable[[], None],
+    *,
+    max_retries: int,
+    base_delay: float,
+    backoff_factor: float,
+    operation_name: str,
+) -> None:
+    last_exception: Exception | None = None
+    delay = base_delay
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            operation()
+            return
+        except Exception as exc:
+            exc_module = type(exc).__module__
+            exc_name = type(exc).__name__
+            is_retryable = (
+                exc_module == "redis.exceptions"
+                and exc_name in ("ConnectionError", "TimeoutError", "BusyLoadingError")
+            ) or isinstance(exc, (OSError, socket.error))
+
+            if not is_retryable:
+                raise
+
+            last_exception = exc
+            if attempt < max_retries:
+                logger.warning(
+                    "Redis operation '%s' failed (attempt %d/%d): %s. Retrying in %.1fs...",
+                    operation_name,
+                    attempt,
+                    max_retries,
+                    exc,
+                    delay,
+                )
+                time.sleep(delay)
+                delay *= backoff_factor
+
+    if last_exception is not None:
+        raise last_exception
+
+
+def _profile_provider(*, cfg: Settings, tier: EmbeddingTier) -> str:
+    if cfg.embedding_rollout_mode == "hash":
+        return "hash"
+    return "local" if tier == EmbeddingTier.TIER1 else "cloud"
+
+
+def _profile_model(*, cfg: Settings, tier: EmbeddingTier) -> str:
+    if tier == EmbeddingTier.TIER1:
+        base_model = cfg.local_embedding_model
+    else:
+        base_model = cfg.cloud_embedding_model
+
+    if cfg.embedding_rollout_mode == "hash":
+        return f"hash:{base_model}"
+    return base_model
 
 
 class IndexBackend(Protocol):
@@ -80,25 +149,35 @@ class HybridVectorIndexStore:
         self,
         cfg: Settings,
         backend: IndexBackend | None = None,
-        tier1_dimension: int = 384,
-        tier4_dimension: int = 3072,
+        tier1_dimension: int | None = None,
+        tier4_dimension: int | None = None,
     ) -> None:
         self.cfg = cfg
-        self.backend = backend or RedisVLIndexBackend(redis_url=cfg.redis_url)
+        resolved_tier1_dimension = tier1_dimension or int(cfg.local_embedding_dimension)
+        resolved_tier4_dimension = tier4_dimension or int(cfg.cloud_embedding_dimension)
+        if backend is not None:
+            self.backend = backend
+        else:
+            self.backend = RedisVLIndexBackend(
+                redis_url=cfg.redis_url,
+                connection_retries=cfg.redis_connection_retries,
+                retry_delay_seconds=cfg.redis_retry_delay_seconds,
+                retry_backoff_factor=cfg.redis_retry_backoff_factor,
+            )
         self._profiles = {
             EmbeddingTier.TIER1: EmbeddingProfile(
                 tier=EmbeddingTier.TIER1,
                 index_name=cfg.redis_index_tier1,
-                provider="local",
-                model_name=cfg.local_embedding_model,
-                dimension=tier1_dimension,
+                provider=_profile_provider(cfg=cfg, tier=EmbeddingTier.TIER1),
+                model_name=_profile_model(cfg=cfg, tier=EmbeddingTier.TIER1),
+                dimension=resolved_tier1_dimension,
             ),
             EmbeddingTier.TIER4: EmbeddingProfile(
                 tier=EmbeddingTier.TIER4,
                 index_name=cfg.redis_index_tier4,
-                provider="cloud",
-                model_name=cfg.cloud_embedding_model,
-                dimension=tier4_dimension,
+                provider=_profile_provider(cfg=cfg, tier=EmbeddingTier.TIER4),
+                model_name=_profile_model(cfg=cfg, tier=EmbeddingTier.TIER4),
+                dimension=resolved_tier4_dimension,
             ),
         }
 
@@ -127,6 +206,9 @@ class HybridVectorIndexStore:
                 )
             )
 
+    def profile(self, tier: EmbeddingTier) -> EmbeddingProfile:
+        return self._profiles[tier]
+
     def persist_records(self, tier: EmbeddingTier, records: list[IndexRecord]) -> None:
         profile = self._profiles[tier]
         for record in records:
@@ -139,14 +221,14 @@ class HybridVectorIndexStore:
                 "record_id": record.record_id,
                 "document_id": record.document_id,
                 "chunk_id": record.chunk_id,
-                "parent_chunk_id": record.parent_chunk_id,
+                "parent_chunk_id": record.parent_chunk_id or "",
                 "text": record.text,
                 "section_path": "/".join(record.section_path),
                 "page_refs": [str(ref) for ref in record.page_refs],
                 "tags": record.tags,
                 "metadata": record.metadata,
-                "embedding_provider": profile.provider,
-                "embedding_model": profile.model_name,
+                "embedding_provider": record.embedding_provider or profile.provider,
+                "embedding_model": record.embedding_model or profile.model_name,
                 "embedding_version": record.embedding_version,
                 "tier": profile.tier.value,
             }
@@ -193,8 +275,18 @@ class HybridVectorIndexStore:
 
 
 class RedisVLIndexBackend:
-    def __init__(self, redis_url: str) -> None:
+    def __init__(
+        self,
+        redis_url: str,
+        *,
+        connection_retries: int = 5,
+        retry_delay_seconds: float = 1.0,
+        retry_backoff_factor: float = 2.0,
+    ) -> None:
         self.redis_url = redis_url
+        self._connection_retries = connection_retries
+        self._retry_delay_seconds = retry_delay_seconds
+        self._retry_backoff_factor = retry_backoff_factor
         self._indices: dict[str, Any] = {}
 
     def ensure_index(self, schema: IndexSchema) -> None:
@@ -243,9 +335,19 @@ class RedisVLIndexBackend:
                 ],
             }
         )
-        index = SearchIndex(schema=redis_schema, redis_url=self.redis_url)
-        index.create(overwrite=False)
-        self._indices[schema.index_name] = index
+
+        def _create_index() -> None:
+            index = SearchIndex(schema=redis_schema, redis_url=self.redis_url)
+            index.create(overwrite=False)
+            self._indices[schema.index_name] = index
+
+        _retry_redis_operation(
+            _create_index,
+            max_retries=self._connection_retries,
+            base_delay=self._retry_delay_seconds,
+            backoff_factor=self._retry_backoff_factor,
+            operation_name=f"ensure_index({schema.index_name})",
+        )
 
     def upsert(
         self,
@@ -258,9 +360,30 @@ class RedisVLIndexBackend:
         if index is None:
             raise IndexingError(f"index '{index_name}' has not been bootstrapped")
 
+        try:
+            import numpy as np
+            from redisvl.redis.utils import array_to_buffer
+        except ModuleNotFoundError as exc:
+            raise IndexingError(
+                "RedisVL backend requires 'numpy' and 'redisvl' packages"
+            ) from exc
+
         record = dict(payload)
         record["id"] = record_id
-        record["embedding"] = vector
+        record["embedding"] = array_to_buffer(
+            np.array(vector, dtype=np.float32), dtype="float32"
+        )
+
+        for key, value in record.items():
+            if isinstance(value, (list, dict)) and key != "embedding":
+                logger.warning(
+                    "Non-serialized field %s=%s (type=%s), converting to JSON",
+                    key,
+                    value,
+                    type(value).__name__,
+                )
+                record[key] = json.dumps(value)
+
         index.load([record], id_field="id")
 
     def query(

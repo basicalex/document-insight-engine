@@ -40,6 +40,12 @@ python -m pytest
 uvicorn src.api.main:app --host 0.0.0.0 --port 8000
 ```
 
+Optional AI parsing/extraction runtime (Docling + LangExtract):
+
+```bash
+python -m pip install -e .[ai]
+```
+
 Run Streamlit UI (in another terminal):
 
 ```bash
@@ -53,15 +59,49 @@ Health check:
 curl http://localhost:8000/healthz
 ```
 
+`/healthz` now reports optional capability diagnostics for Docling and
+LangExtract under `capabilities`, including `enabled`, `ready`, and
+actionable `hint` values when dependencies are missing or disabled.
+
 ## Setup (Docker)
 
 ```bash
 docker compose up --build
 ```
 
+## Setup (Docker dev overlay, fast iteration)
+
+Use the dev overlay to avoid rebuilding on every code change. It bind-mounts
+`src/` and `frontend/` into containers and runs API with `--reload`.
+
+Start infra once:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d redis ollama
+```
+
+Run API + UI in dev mode:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d api ui
+```
+
+View logs while developing:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml logs -f api ui
+```
+
+Rebuild is only needed when dependencies or Dockerfile layers change:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build api ui
+```
+
 Services started by compose:
 
 - `api` (FastAPI)
+- `ui` (Streamlit, available at `http://localhost:8501`)
 - `redis` (persistent volume)
 - `ollama` (model cache mounted under `./models`)
 
@@ -70,10 +110,12 @@ Services started by compose:
 Current API endpoints:
 
 - `GET /healthz`
+- `GET /readyz`
 - `POST /ingest`
 - `GET /ingest/{document_id}`
 - `POST /upload`
 - `POST /ask`
+- `POST /ask/stream`
 
 Planned/next API endpoints:
 
@@ -83,6 +125,18 @@ Deep mode capability:
 
 - Deep mode is disabled by default at runtime.
 - Enable with env vars: `DEEP_MODE_ENABLED=true` and `CLOUD_AGENT_PROVIDER=fallback`.
+
+Parser routing capability:
+
+- Runtime parser chain is configurable with `PARSER_ROUTING_MODE`.
+- Default order is `docling -> google -> fallback` (`docling_google_fallback`).
+- Google parser step requires `CLOUD_AGENT_API_KEY`; otherwise routing falls through to fallback parser.
+
+Index backend policy:
+
+- API startup now fails fast if Redis/RedisVL index bootstrap is unavailable.
+- Local/dev fallback to in-memory indexing is only allowed when explicitly enabled with `ALLOW_IN_MEMORY_INDEX_FALLBACK=true`.
+- `GET /readyz` reports `200` only when index backend is fully ready; degraded fallback mode reports `503` with diagnostics.
 
 Contract examples:
 

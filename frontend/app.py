@@ -177,29 +177,45 @@ def _handle_chat_prompt() -> None:
         st.markdown(prompt)
 
     with st.chat_message("assistant"):
-        with st.spinner("Thinking..."):
-            try:
-                with DocumentInsightApi(
-                    base_url=st.session_state["api_base_url"]
-                ) as api:
-                    response = api.ask(
-                        question=prompt,
+        answer_placeholder = st.empty()
+        answer_placeholder.markdown("_Starting response..._")
+        try:
+            with DocumentInsightApi(base_url=st.session_state["api_base_url"]) as api:
+                try:
+                    response = _consume_streamed_response(
+                        events=api.ask_stream_events(
+                            question=prompt,
+                            mode=st.session_state["chat_mode"],
+                            document_id=st.session_state["active_document_id"] or None,
+                            session_id=st.session_state["session_id"] or None,
+                        ),
+                        placeholder=answer_placeholder,
                         mode=st.session_state["chat_mode"],
                         document_id=st.session_state["active_document_id"] or None,
-                        session_id=st.session_state["session_id"] or None,
                     )
-            except ApiError as exc:
-                error_text = _format_api_error(exc)
-                append_assistant_message(
-                    st.session_state,
-                    content=error_text,
-                    mode=st.session_state["chat_mode"],
-                    insufficient_evidence=True,
-                    citations=[],
-                    trace=None,
-                )
-                st.error(error_text)
-                return
+                except ApiError as stream_error:
+                    if stream_error.status_code == 404:
+                        response = api.ask(
+                            question=prompt,
+                            mode=st.session_state["chat_mode"],
+                            document_id=st.session_state["active_document_id"] or None,
+                            session_id=st.session_state["session_id"] or None,
+                        )
+                        answer_placeholder.markdown(str(response.get("answer", "")))
+                    else:
+                        raise
+        except ApiError as exc:
+            error_text = _format_api_error(exc)
+            append_assistant_message(
+                st.session_state,
+                content=error_text,
+                mode=st.session_state["chat_mode"],
+                insufficient_evidence=True,
+                citations=[],
+                trace=None,
+            )
+            st.error(error_text)
+            return
 
         answer = str(response.get("answer", ""))
         mode = str(response.get("mode", st.session_state["chat_mode"]))
@@ -216,8 +232,59 @@ def _handle_chat_prompt() -> None:
             trace=trace if isinstance(trace, dict) else None,
         )
 
-        st.markdown(answer)
         _render_assistant_details(st.session_state["messages"][-1])
+
+
+def _consume_streamed_response(
+    *,
+    events: Any,
+    placeholder: Any,
+    mode: str,
+    document_id: str | None,
+) -> dict[str, Any]:
+    chunks: list[str] = []
+    final_payload: dict[str, Any] | None = None
+
+    for event in events:
+        if not isinstance(event, dict):
+            continue
+
+        event_type = str(event.get("type", "")).strip().lower()
+        if event_type == "status":
+            status_message = str(event.get("message", "")).strip()
+            if status_message:
+                placeholder.markdown(f"_{status_message}_")
+            continue
+
+        if event_type == "token":
+            delta = str(event.get("delta", ""))
+            if not delta:
+                continue
+            chunks.append(delta)
+            placeholder.markdown("".join(chunks))
+            continue
+
+        if event_type == "final":
+            payload = event.get("response")
+            if isinstance(payload, dict):
+                final_payload = payload
+
+    if final_payload is None:
+        final_payload = {
+            "answer": "".join(chunks).strip(),
+            "mode": mode,
+            "document_id": document_id,
+            "insufficient_evidence": False,
+            "citations": [],
+            "trace": None,
+        }
+
+    answer = str(final_payload.get("answer", "")).strip()
+    if not answer:
+        answer = "I could not produce a response. Please retry."
+        final_payload["answer"] = answer
+    placeholder.markdown(answer)
+    return final_payload
 
 
 def _render_assistant_details(message: dict[str, Any]) -> None:

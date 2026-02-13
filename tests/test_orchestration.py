@@ -56,6 +56,7 @@ class StubParser:
                     page_number=1,
                 )
             ],
+            parser_name="docling",
         )
 
 
@@ -174,6 +175,13 @@ def test_orchestration_happy_path_reaches_indexed_with_all_stages() -> None:
     assert record.completed_stages == ["extract", "parse", "chunk", "embed", "index"]
     assert "tier1-1" in backend.records["tier1_idx"]
     assert "tier4-1" in backend.records["tier4_idx"]
+    parser_events = [
+        event
+        for event in record.events
+        if event.stage == "parse" and event.message == "parser selected"
+    ]
+    assert parser_events
+    assert parser_events[0].metadata["parser"] == "docling"
 
 
 def test_orchestration_retries_retryable_stage_then_succeeds() -> None:

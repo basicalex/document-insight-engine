@@ -44,14 +44,56 @@ class Settings(BaseSettings):
     redis_url: str = "redis://redis:6379/0"
     redis_index_tier1: str = "tier1_idx"
     redis_index_tier4: str = "tier4_idx"
+    redis_connection_retries: PositiveInt = 5
+    redis_retry_delay_seconds: float = 1.0
+    redis_retry_backoff_factor: float = 2.0
+    allow_in_memory_index_fallback: bool = False
+    api_state_backend: Literal["auto", "redis", "memory"] = "auto"
+    api_state_key_prefix: str = "die:state"
+    api_state_idempotency_ttl_seconds: PositiveInt = 24 * 60 * 60
+    api_state_ingestion_ttl_seconds: PositiveInt = 30 * 24 * 60 * 60
+    api_state_session_ttl_seconds: PositiveInt = 7 * 24 * 60 * 60
+    api_state_idempotency_claim_ttl_seconds: PositiveInt = 5 * 60
+    api_state_session_max_turns: PositiveInt = 8
 
     ollama_base_url: str = "http://ollama:11434"
-    local_llm_model: str = "llama3.2"
+    local_llm_model: str = "llama3.2:1b"
+    embedding_rollout_mode: Literal[
+        "hash", "provider", "provider_with_hash_fallback"
+    ] = "provider_with_hash_fallback"
+    embedding_filter_strict: bool = True
+    embedding_timeout_seconds: PositiveInt = 30
+    local_embedding_provider: Literal["hash", "ollama"] = "ollama"
     local_embedding_model: str = "all-MiniLM-L6-v2"
+    local_embedding_dimension: PositiveInt = 384
+    cloud_embedding_provider: Literal["hash", "gemini"] = "gemini"
     cloud_embedding_model: str = "gemini-embedding-001"
+    cloud_embedding_dimension: PositiveInt = 3072
+
+    docling_enabled: bool = True
+    google_parser_enabled: bool = True
+    parser_routing_mode: Literal[
+        "docling_google_fallback",
+        "google_docling_fallback",
+        "docling_fallback",
+        "google_fallback",
+        "fallback_only",
+    ] = "docling_google_fallback"
+    langextract_enabled: bool = True
+    extraction_max_input_tokens: PositiveInt = 12000
+    extraction_max_output_tokens: PositiveInt = 4000
+    extraction_strict_schema: bool = True
 
     deep_mode_enabled: bool = False
-    cloud_agent_provider: Literal["disabled", "fallback"] = "disabled"
+    cloud_agent_provider: Literal["disabled", "fallback", "gemini"] = "disabled"
+    cloud_agent_model: str = "gemini-2.5-flash"
+    cloud_agent_api_key: str | None = None
+    cloud_agent_api_base_url: str = "https://generativelanguage.googleapis.com"
+    cloud_agent_timeout_seconds: PositiveInt = 30
+    cloud_agent_retry_attempts: int = Field(default=3, ge=1, le=10)
+    cloud_agent_retry_initial_backoff_seconds: float = Field(default=0.5, gt=0)
+    cloud_agent_retry_backoff_factor: float = Field(default=2.0, ge=1.0, le=5.0)
+    cloud_agent_retry_max_backoff_seconds: float = Field(default=8.0, gt=0)
 
     max_upload_size_mb: PositiveInt = 50
     request_timeout_seconds: PositiveInt = 60
@@ -72,15 +114,51 @@ class Settings(BaseSettings):
             raise ValueError("directory names must be relative and traversal-safe")
         return value
 
+    @field_validator("api_state_key_prefix")
+    @classmethod
+    def validate_state_key_prefix(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("api_state_key_prefix cannot be empty")
+        return normalized
+
     @model_validator(mode="after")
     def validate_timeouts(self) -> "Settings":
         if self.request_timeout_seconds > self.ingest_timeout_seconds:
             raise ValueError(
                 "request_timeout_seconds cannot exceed ingest_timeout_seconds"
             )
+        if (
+            self.cloud_agent_retry_initial_backoff_seconds
+            > self.cloud_agent_retry_max_backoff_seconds
+        ):
+            raise ValueError(
+                "cloud_agent_retry_initial_backoff_seconds cannot exceed cloud_agent_retry_max_backoff_seconds"
+            )
         if self.deep_mode_enabled and self.cloud_agent_provider == "disabled":
             raise ValueError(
                 "cloud_agent_provider cannot be disabled when deep_mode_enabled is true"
+            )
+        if self.cloud_agent_provider == "gemini" and not (
+            self.cloud_agent_api_key and self.cloud_agent_api_key.strip()
+        ):
+            raise ValueError(
+                "cloud_agent_api_key is required when cloud_agent_provider is gemini"
+            )
+        if (
+            self.embedding_rollout_mode == "provider"
+            and self.cloud_embedding_provider == "gemini"
+            and not (self.cloud_agent_api_key and self.cloud_agent_api_key.strip())
+        ):
+            raise ValueError(
+                "cloud_agent_api_key is required for provider embedding rollout with gemini"
+            )
+        if self.allow_in_memory_index_fallback and self.environment not in (
+            "local",
+            "dev",
+        ):
+            raise ValueError(
+                "allow_in_memory_index_fallback is only permitted in local or dev environments"
             )
         return self
 

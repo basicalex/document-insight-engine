@@ -9,6 +9,7 @@ from typing import Any, Iterator
 from fastapi.testclient import TestClient
 
 from src.api.main import ApiServices, app
+from src.api.state_store import InMemoryApiStateStore
 from src.config.settings import Settings
 from src.engine.cloud_agent import CloudAgentEngine
 from src.engine.extractor import Tier4StructuredExtractor
@@ -131,8 +132,21 @@ def _build_services(
         cfg=cfg,
         intake=UploadIntakeService(cfg),
         index_store=index_store,
+        index_readiness={
+            "state": "ready",
+            "backend": type(index_store.backend).__name__,
+            "reason": "test_backend",
+            "fallback_allowed": False,
+            "degraded": False,
+        },
         local_qa=local_qa,
         cloud_agent=cloud,
+        state_store=InMemoryApiStateStore(
+            idempotency_ttl_seconds=cfg.api_state_idempotency_ttl_seconds,
+            ingestion_ttl_seconds=cfg.api_state_ingestion_ttl_seconds,
+            session_ttl_seconds=cfg.api_state_session_ttl_seconds,
+            idempotency_claim_ttl_seconds=cfg.api_state_idempotency_claim_ttl_seconds,
+        ),
     )
 
 

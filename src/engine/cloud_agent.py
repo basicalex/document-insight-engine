@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any, Callable, Protocol
 
 from src.config.settings import Settings, settings
@@ -10,6 +11,50 @@ from src.tools import get_fs_tools
 
 
 ALLOWED_TOOL_NAMES = ("list_sections", "read_section", "keyword_grep")
+
+
+class DeepProviderAction(str, Enum):
+    FINAL = "final"
+    TOOL_CALL = "tool_call"
+
+
+class DeepProviderErrorCode(str, Enum):
+    NOT_CONFIGURED = "provider_not_configured"
+    AUTHENTICATION_FAILED = "provider_auth_failed"
+    RATE_LIMITED = "provider_rate_limited"
+    TIMEOUT = "provider_timeout"
+    UNAVAILABLE = "provider_unavailable"
+    MALFORMED_RESPONSE = "provider_malformed_response"
+
+
+@dataclass(frozen=True)
+class DeepProviderRetryPolicy:
+    attempts: int = 3
+    initial_backoff_seconds: float = 0.5
+    backoff_factor: float = 2.0
+    max_backoff_seconds: float = 8.0
+
+
+@dataclass(frozen=True)
+class DeepProviderDecision:
+    action: DeepProviderAction
+    answer: str = ""
+    insufficient_evidence: bool = False
+    tool_name: str = ""
+    arguments: dict[str, Any] | None = None
+
+
+@dataclass(frozen=True)
+class _ProviderDecisionError:
+    code: str
+    message: str
+
+
+class CloudAgentProviderError(Exception):
+    def __init__(self, *, code: DeepProviderErrorCode, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
 
 
 class CloudAgentModelClient(Protocol):
@@ -22,7 +67,7 @@ class CloudAgentModelClient(Protocol):
         iteration: int,
         history: list[dict[str, Any]],
         allowed_tools: list[str],
-    ) -> dict[str, Any]: ...
+    ) -> DeepProviderDecision | dict[str, Any]: ...
 
 
 ToolCallable = Callable[..., dict[str, Any]]
@@ -82,16 +127,41 @@ class CloudAgentEngine:
 
         for iteration in range(1, self.max_iterations + 1):
             turn_started = time.perf_counter()
-            decision = self.model_client.next_step(
-                question=question,
-                mode=mode,
-                document_id=document_id,
-                iteration=iteration,
-                history=history,
-                allowed_tools=list(ALLOWED_TOOL_NAMES),
-            )
+            try:
+                raw_decision = self.model_client.next_step(
+                    question=question,
+                    mode=mode,
+                    document_id=document_id,
+                    iteration=iteration,
+                    history=history,
+                    allowed_tools=list(ALLOWED_TOOL_NAMES),
+                )
+            except CloudAgentProviderError as exc:
+                trace_events.append(
+                    TraceEvent(
+                        stage="agent",
+                        message="provider request failed",
+                        latency_ms=_latency_ms(turn_started),
+                        metadata={
+                            "iteration": str(iteration),
+                            "code": exc.code.value,
+                        },
+                    )
+                )
+                return self._terminal_response(
+                    mode=mode,
+                    document_id=document_id,
+                    answer="Deep reasoning is temporarily unavailable from the configured provider.",
+                    insufficient_evidence=True,
+                    retrieved_keys=retrieved_keys,
+                    trace_events=trace_events,
+                    iterations=iteration,
+                    termination_reason=exc.code.value,
+                    started=started,
+                )
 
-            if not isinstance(decision, dict):
+            normalized_decision = _normalize_provider_decision(raw_decision)
+            if isinstance(normalized_decision, _ProviderDecisionError):
                 return self._terminal_response(
                     mode=mode,
                     document_id=document_id,
@@ -102,14 +172,13 @@ class CloudAgentEngine:
                     retrieved_keys=retrieved_keys,
                     trace_events=trace_events,
                     iterations=iteration,
-                    termination_reason="invalid_model_output",
+                    termination_reason=normalized_decision.code,
                     started=started,
                 )
 
-            action = str(decision.get("action", "")).strip().lower()
-            if action == "final":
-                answer = str(decision.get("answer", "")).strip()
-                insufficient = bool(decision.get("insufficient_evidence", False))
+            if normalized_decision.action == DeepProviderAction.FINAL:
+                answer = normalized_decision.answer.strip()
+                insufficient = normalized_decision.insufficient_evidence
                 if not answer:
                     answer = (
                         "I do not have enough grounded evidence in the document to "
@@ -139,21 +208,8 @@ class CloudAgentEngine:
                     started=started,
                 )
 
-            if action != "tool_call":
-                return self._terminal_response(
-                    mode=mode,
-                    document_id=document_id,
-                    answer="Deep reasoning failed because the agent action was invalid.",
-                    insufficient_evidence=True,
-                    retrieved_keys=retrieved_keys,
-                    trace_events=trace_events,
-                    iterations=iteration,
-                    termination_reason="invalid_model_output",
-                    started=started,
-                )
-
-            tool_name = str(decision.get("tool_name", "")).strip()
-            arguments = decision.get("arguments", {})
+            tool_name = normalized_decision.tool_name
+            arguments = normalized_decision.arguments or {}
             validated = _validate_tool_invocation(
                 tool_name=tool_name, arguments=arguments
             )
@@ -314,6 +370,66 @@ def run_agent(
         cfg=cfg,
     )
     return engine.ask(question=question, mode=mode, document_id=document_id)
+
+
+def _normalize_provider_decision(
+    raw: DeepProviderDecision | dict[str, Any],
+) -> DeepProviderDecision | _ProviderDecisionError:
+    if isinstance(raw, DeepProviderDecision):
+        return raw
+    if not isinstance(raw, dict):
+        return _ProviderDecisionError(
+            code=DeepProviderErrorCode.MALFORMED_RESPONSE.value,
+            message="provider decision must be an object",
+        )
+
+    action_raw = str(raw.get("action", "")).strip().lower()
+    if action_raw == DeepProviderAction.FINAL.value:
+        answer = raw.get("answer", "")
+        if answer is None:
+            answer = ""
+        if not isinstance(answer, str):
+            return _ProviderDecisionError(
+                code=DeepProviderErrorCode.MALFORMED_RESPONSE.value,
+                message="final.answer must be a string",
+            )
+        insufficient = raw.get("insufficient_evidence", False)
+        if not isinstance(insufficient, bool):
+            return _ProviderDecisionError(
+                code=DeepProviderErrorCode.MALFORMED_RESPONSE.value,
+                message="final.insufficient_evidence must be a boolean",
+            )
+        return DeepProviderDecision(
+            action=DeepProviderAction.FINAL,
+            answer=answer,
+            insufficient_evidence=insufficient,
+        )
+
+    if action_raw == DeepProviderAction.TOOL_CALL.value:
+        tool_name = raw.get("tool_name")
+        if not isinstance(tool_name, str) or not tool_name.strip():
+            return _ProviderDecisionError(
+                code=DeepProviderErrorCode.MALFORMED_RESPONSE.value,
+                message="tool_call.tool_name must be a non-empty string",
+            )
+        arguments = raw.get("arguments", {})
+        if arguments is None:
+            arguments = {}
+        if not isinstance(arguments, dict):
+            return _ProviderDecisionError(
+                code=DeepProviderErrorCode.MALFORMED_RESPONSE.value,
+                message="tool_call.arguments must be an object",
+            )
+        return DeepProviderDecision(
+            action=DeepProviderAction.TOOL_CALL,
+            tool_name=tool_name.strip(),
+            arguments=arguments,
+        )
+
+    return _ProviderDecisionError(
+        code=DeepProviderErrorCode.MALFORMED_RESPONSE.value,
+        message="action must be 'final' or 'tool_call'",
+    )
 
 
 def _validate_tool_invocation(

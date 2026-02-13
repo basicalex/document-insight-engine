@@ -1,0 +1,44 @@
+services:
+  api:
+    command:
+      [
+        "uvicorn",
+        "src.api.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--reload",
+        "--reload-dir",
+        "/app/src",
+        "--reload-dir",
+        "/app/frontend",
+      ]
+    volumes:
+      - ./src:/app/src
+      - ./frontend:/app/frontend
+      - ./data:/app/data
+    environment:
+      REQUEST_TIMEOUT_SECONDS: 120
+      LOCAL_LLM_MODEL: llama3.2:1b
+      DOCLING_ENABLED: "true"
+      GOOGLE_PARSER_ENABLED: "true"
+      LANGEXTRACT_ENABLED: "true"
+
+  ui:
+    command:
+      [
+        "streamlit",
+        "run",
+        "frontend/app.py",
+        "--server.address=0.0.0.0",
+        "--server.port=8501",
+        "--server.fileWatcherType=poll",
+        "--browser.gatherUsageStats=false",
+      ]
+    volumes:
+      - ./frontend:/app/frontend
+      - ./src:/app/src
+      - ./data:/app/data
+    environment:
+      DOCUMENT_INSIGHT_API_BASE_URL: http://api:8000

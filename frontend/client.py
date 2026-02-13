@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import Any
+import json
+from typing import Any, Iterator
 
 import httpx
 
 
-DEFAULT_TIMEOUT_SECONDS = 30.0
+DEFAULT_TIMEOUT_SECONDS = 120.0
 
 
 @dataclass(slots=True)
@@ -147,6 +148,44 @@ class DocumentInsightApi:
             ) from exc
 
         return _decode_response(response)
+
+    def ask_stream_events(
+        self,
+        *,
+        question: str,
+        mode: str,
+        document_id: str | None = None,
+        session_id: str | None = None,
+    ) -> Iterator[dict[str, Any]]:
+        payload: dict[str, Any] = {"question": question, "mode": mode}
+        if document_id:
+            payload["document_id"] = document_id
+        if session_id:
+            payload["session_id"] = session_id
+
+        try:
+            with self._client.stream("POST", "/ask/stream", json=payload) as response:
+                if response.is_error:
+                    raise _build_api_error(
+                        response=response, payload=_safe_json(response)
+                    )
+
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(event, dict):
+                        yield event
+        except httpx.HTTPError as exc:
+            raise ApiError(
+                status_code=0,
+                code="network_error",
+                message="unable to reach API service",
+                details={"error": str(exc)},
+            ) from exc
 
 
 def _decode_response(response: httpx.Response) -> dict[str, Any]:

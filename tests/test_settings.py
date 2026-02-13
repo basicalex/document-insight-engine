@@ -49,3 +49,72 @@ def test_settings_rejects_enabled_deep_mode_with_disabled_provider() -> None:
 def test_settings_accepts_enabled_deep_mode_with_fallback_provider() -> None:
     cfg = Settings(deep_mode_enabled=True, cloud_agent_provider="fallback")
     assert cfg.deep_mode_enabled is True
+
+
+def test_settings_rejects_gemini_provider_without_api_key() -> None:
+    with pytest.raises(ValidationError):
+        Settings(cloud_agent_provider="gemini")
+
+
+def test_settings_accepts_gemini_provider_with_api_key() -> None:
+    cfg = Settings(cloud_agent_provider="gemini", cloud_agent_api_key="test-key")
+    assert cfg.cloud_agent_provider == "gemini"
+
+
+def test_settings_rejects_retry_initial_backoff_above_max() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            cloud_agent_retry_initial_backoff_seconds=2.0,
+            cloud_agent_retry_max_backoff_seconds=1.0,
+        )
+
+
+def test_settings_rejects_provider_embedding_rollout_without_gemini_key() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            embedding_rollout_mode="provider",
+            cloud_embedding_provider="gemini",
+            cloud_agent_provider="fallback",
+            cloud_agent_api_key=None,
+        )
+
+
+def test_settings_allows_hash_fallback_embedding_rollout_without_gemini_key() -> None:
+    cfg = Settings(
+        embedding_rollout_mode="provider_with_hash_fallback",
+        cloud_embedding_provider="gemini",
+        cloud_agent_provider="fallback",
+        cloud_agent_api_key=None,
+    )
+    assert cfg.embedding_rollout_mode == "provider_with_hash_fallback"
+
+
+def test_settings_accepts_memory_api_state_backend() -> None:
+    cfg = Settings(api_state_backend="memory")
+    assert cfg.api_state_backend == "memory"
+
+
+def test_settings_rejects_empty_api_state_key_prefix() -> None:
+    with pytest.raises(ValidationError):
+        Settings(api_state_key_prefix="   ")
+
+
+def test_settings_allows_in_memory_index_fallback_in_dev() -> None:
+    cfg = Settings(environment="dev", allow_in_memory_index_fallback=True)
+    assert cfg.allow_in_memory_index_fallback is True
+
+
+def test_settings_rejects_in_memory_index_fallback_in_prod() -> None:
+    with pytest.raises(ValidationError):
+        Settings(environment="prod", allow_in_memory_index_fallback=True)
+
+
+def test_settings_supports_optional_capability_toggles() -> None:
+    cfg = Settings(docling_enabled=False, langextract_enabled=False)
+    assert cfg.docling_enabled is False
+    assert cfg.langextract_enabled is False
+
+
+def test_settings_accepts_parser_routing_modes() -> None:
+    cfg = Settings(parser_routing_mode="google_docling_fallback")
+    assert cfg.parser_routing_mode == "google_docling_fallback"

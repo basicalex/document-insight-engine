@@ -21,6 +21,7 @@ class ParsedMarkdownDocument:
     source_path: Path
     markdown: str
     blocks: list[ParsedBlock]
+    parser_name: str = "unknown"
 
 
 @dataclass(frozen=True)
@@ -75,6 +76,7 @@ class Tier2DoclingParser:
             source_path=file_path,
             markdown=markdown,
             blocks=blocks,
+            parser_name="docling",
         )
 
     def _get_backend(self) -> DoclingBackend:

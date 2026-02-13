@@ -1,4 +1,13 @@
-from src.engine.cloud_agent import ALLOWED_TOOL_NAMES, CloudAgentEngine, run_agent
+from src.engine.cloud_agent import (
+    ALLOWED_TOOL_NAMES,
+    CloudAgentEngine,
+    CloudAgentProviderError,
+    DeepProviderAction,
+    DeepProviderDecision,
+    DeepProviderErrorCode,
+    DeepProviderRetryPolicy,
+    run_agent,
+)
 from src.engine.extractor import (
     FieldProvenance,
     StructuredExtractionEnvelope,
@@ -8,20 +17,29 @@ from src.engine.extractor import (
     ValidationDiagnostic,
     extract_structured,
 )
+from src.engine.gemini_client import GeminiCloudModelClient
 from src.engine.local_llm import (
     HashingQueryEmbedder,
     LocalQAEngine,
     OllamaGenerateError,
+    ProviderQueryEmbedder,
     generate_local,
 )
 
 __all__ = [
     "ALLOWED_TOOL_NAMES",
     "CloudAgentEngine",
+    "CloudAgentProviderError",
+    "DeepProviderAction",
+    "DeepProviderDecision",
+    "DeepProviderErrorCode",
+    "DeepProviderRetryPolicy",
     "FieldProvenance",
     "HashingQueryEmbedder",
+    "GeminiCloudModelClient",
     "LocalQAEngine",
     "OllamaGenerateError",
+    "ProviderQueryEmbedder",
     "StructuredExtractionEnvelope",
     "StructuredExtractionError",
     "StructuredExtractionResult",

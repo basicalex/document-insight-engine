@@ -150,3 +150,22 @@ def test_cloud_agent_executes_allowed_tool_then_returns_final_answer() -> None:
     assert response.trace.iterations == 2
     assert response.trace.termination_reason == "completed"
     assert response.trace.retrieved_chunk_ids == ["msa/confidentiality"]
+
+
+def test_cloud_agent_rejects_malformed_provider_payload() -> None:
+    model = ScriptedModel(steps=[{"action": "unknown"}])
+    engine = CloudAgentEngine(
+        model_client=model,
+        tool_provider=lambda _document_id: {},
+    )
+
+    response = engine.ask(
+        question="Find obligations.",
+        mode=Mode.DEEP,
+        document_id="doc-4",
+    )
+
+    assert response.insufficient_evidence is True
+    assert response.trace is not None
+    assert response.trace.iterations == 1
+    assert response.trace.termination_reason == "provider_malformed_response"
