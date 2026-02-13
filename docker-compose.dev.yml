@@ -23,6 +23,9 @@ services:
       LOCAL_LLM_MODEL: llama3.2:1b
       DEEP_MODE_ENABLED: "true"
       CLOUD_AGENT_PROVIDER: local
+      LOCAL_EMBEDDING_PROVIDER: ollama
+      CLOUD_EMBEDDING_PROVIDER: ollama
+      EMBEDDING_ROLLOUT_MODE: provider
       DOCLING_ENABLED: "true"
       GOOGLE_PARSER_ENABLED: "true"
       LANGEXTRACT_ENABLED: "true"

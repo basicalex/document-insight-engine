@@ -18,6 +18,9 @@ def test_compose_includes_core_services() -> None:
     assert 'LANGEXTRACT_ENABLED: "true"' in compose
     assert 'DEEP_MODE_ENABLED: "true"' in compose
     assert "CLOUD_AGENT_PROVIDER: local" in compose
+    assert "LOCAL_EMBEDDING_PROVIDER: ollama" in compose
+    assert "CLOUD_EMBEDDING_PROVIDER: ollama" in compose
+    assert "EMBEDDING_ROLLOUT_MODE: provider" in compose
 
 
 def test_dev_compose_enables_reload_and_bind_mounts() -> None:
@@ -31,6 +34,8 @@ def test_dev_compose_enables_reload_and_bind_mounts() -> None:
     assert "--server.fileWatcherType=poll" in compose
     assert 'DEEP_MODE_ENABLED: "true"' in compose
     assert "CLOUD_AGENT_PROVIDER: local" in compose
+    assert "LOCAL_EMBEDDING_PROVIDER: ollama" in compose
+    assert "CLOUD_EMBEDDING_PROVIDER: ollama" in compose
 
 
 def test_dockerfile_installs_optional_ai_dependencies() -> None:

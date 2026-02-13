@@ -66,7 +66,11 @@
             ]
           }
         ],
-        "aocPrd": null,
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-13T14:03:52Z",
+          "version": 1
+        },
         "updatedAt": "2026-02-13T09:55:12.691Z",
         "activeAgent": false
       },
@@ -135,7 +139,11 @@
             ]
           }
         ],
-        "aocPrd": null,
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-13T14:03:52Z",
+          "version": 1
+        },
         "updatedAt": "2026-02-13T10:17:49.539Z",
         "activeAgent": false
       },
@@ -213,7 +221,11 @@
             ]
           }
         ],
-        "aocPrd": null,
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-13T14:03:52Z",
+          "version": 1
+        },
         "updatedAt": "2026-02-13T10:34:08.578Z",
         "activeAgent": false
       },
@@ -282,7 +294,11 @@
             ]
           }
         ],
-        "aocPrd": null,
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-13T14:03:52Z",
+          "version": 1
+        },
         "updatedAt": "2026-02-13T10:40:35.414Z",
         "activeAgent": false
       },
@@ -351,7 +367,11 @@
             ]
           }
         ],
-        "aocPrd": null,
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-13T14:03:52Z",
+          "version": 1
+        },
         "updatedAt": "2026-02-13T10:50:29.028Z",
         "activeAgent": false
       },
@@ -420,7 +440,11 @@
             ]
           }
         ],
-        "aocPrd": null,
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-13T14:03:52Z",
+          "version": 1
+        },
         "updatedAt": "2026-02-13T10:59:28.847Z",
         "activeAgent": false
       },
@@ -489,7 +513,11 @@
             ]
           }
         ],
-        "aocPrd": null,
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-13T14:03:52Z",
+          "version": 1
+        },
         "updatedAt": "2026-02-13T11:05:47.368Z",
         "activeAgent": false
       },
@@ -558,7 +586,11 @@
             ]
           }
         ],
-        "aocPrd": null,
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-13T14:03:52Z",
+          "version": 1
+        },
         "updatedAt": "2026-02-13T11:32:21.787Z",
         "activeAgent": false
       },
@@ -626,7 +658,11 @@
             ]
           }
         ],
-        "aocPrd": null,
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-13T14:03:52Z",
+          "version": 1
+        },
         "updatedAt": "2026-02-13T12:07:07.802Z",
         "activeAgent": false
       },
@@ -669,7 +705,11 @@
             "dependencies": []
           }
         ],
-        "aocPrd": null,
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-13T14:03:52Z",
+          "version": 1
+        },
         "updatedAt": "2026-02-13T12:42:25.496Z",
         "activeAgent": false
       }
@@ -694,14 +734,14 @@
             "id": 1,
             "title": "Create phase test matrix and fixture inventory",
             "description": "Define coverage matrix for ingest-to-ask flows, restart persistence, loop guard, latency checks, and extraction-accuracy grounding checks; map required fixtures under tests/data while targeting a 60/30/10 unit/integration/E2E split.",
-            "status": "pending",
+            "status": "done",
             "dependencies": []
           },
           {
             "id": 2,
             "title": "Implement API integration tests in tests/test_api.py",
             "description": "Add end-to-end API flow coverage for ingest and ask across fast/deep modes with deterministic assertions.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "1"
             ]
@@ -710,7 +750,7 @@
             "id": 3,
             "title": "Add restart persistence verification tests",
             "description": "Simulate service restart cycles and assert previously ingested document data remains queryable with no record loss.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "1",
               "2"
@@ -720,7 +760,7 @@
             "id": 4,
             "title": "Add loop-guard and safety regression tests",
             "description": "Assert Tier 3 orchestration enforces 5-iteration cap and surfaces expected termination diagnostics.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "2"
             ]
@@ -729,7 +769,7 @@
             "id": 5,
             "title": "Instrument latency checks and CI-friendly reporting",
             "description": "Capture Tier 1 latency metrics with pass/fail thresholds and generate machine-readable test reports for regression tracking.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "2",
               "3",
@@ -768,14 +808,14 @@
             "id": 1,
             "title": "Define /ingest and /ask request/response contracts",
             "description": "Finalize Pydantic schemas for payloads, response envelopes, grounding fields, and correlation ID propagation.",
-            "status": "pending",
+            "status": "done",
             "dependencies": []
           },
           {
             "id": 2,
             "title": "Implement POST /ingest endpoint with retry-safe semantics",
             "description": "Wire endpoint to ingestion orchestration, enforce validation bounds, and return deterministic status/error mapping for retries.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "1"
             ]
@@ -784,7 +824,7 @@
             "id": 3,
             "title": "Implement POST /ask endpoint with mode-aware routing",
             "description": "Route fast/deep modes to local QA or agent/extraction pipelines and enforce grounding/citation-ready response fields.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "1"
             ]
@@ -793,7 +833,7 @@
             "id": 4,
             "title": "Add API guardrails for timeout, error normalization, and idempotency",
             "description": "Centralize exception mapping, timeout handling, and idempotency behavior to prevent duplicate side effects and ambiguous failures.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "2",
               "3"
@@ -803,7 +843,7 @@
             "id": 5,
             "title": "Create integration tests for contracts and malformed payloads",
             "description": "Cover happy paths, malformed requests, idempotent ingest retries, and mode routing correctness across /ingest and /ask.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "2",
               "3",
@@ -853,7 +893,11 @@
         "dependencies": [],
         "priority": "medium",
         "subtasks": [],
-        "aocPrd": null,
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-13T14:03:52Z",
+          "version": 1
+        },
         "updatedAt": "2026-02-11T12:27:28.354Z",
         "activeAgent": false
       }
@@ -980,14 +1024,14 @@
             "id": 1,
             "title": "Define ingestion lifecycle model and state transitions",
             "description": "Specify transitions for uploaded->processing->partial/indexed/failed, stage boundaries, and terminal conditions; include validation rules for illegal transitions.",
-            "status": "pending",
+            "status": "done",
             "dependencies": []
           },
           {
             "id": 2,
             "title": "Implement orchestrator runner for parse/chunk/embed/index stages",
             "description": "Build pipeline coordinator that executes stages in order, captures stage outputs, and propagates typed errors with retry/backoff hooks.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "1"
             ]
@@ -996,7 +1040,7 @@
             "id": 3,
             "title": "Add idempotency and duplicate-ingest safeguards",
             "description": "Enforce idempotency keys/document replay checks so repeated requests do not duplicate vectors or corrupt state.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "2"
             ]
@@ -1005,7 +1049,7 @@
             "id": 4,
             "title": "Instrument structured logging and correlation IDs",
             "description": "Emit structured logs keyed by document_id with stage timing, retry counts, and failure codes to support debugging and audits.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "2"
             ]
@@ -1014,7 +1058,7 @@
             "id": 5,
             "title": "Build integration tests for lifecycle and failure injection",
             "description": "Validate happy path to indexed plus injected failures at each stage to confirm status transitions, retries, and partial/failed outcomes.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "2",
               "3",
@@ -1092,14 +1136,14 @@
             "id": 1,
             "title": "Define agent loop state machine and termination semantics",
             "description": "Specify turn lifecycle, allowed transitions, and explicit termination reasons including max-loop stop at 5 iterations.",
-            "status": "pending",
+            "status": "done",
             "dependencies": []
           },
           {
             "id": 2,
             "title": "Implement strict tool allowlist and invocation validator",
             "description": "Permit only list_sections/read_section/keyword_grep with input schema checks and safe rejection of unsupported tool calls.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "1"
             ]
@@ -1108,7 +1152,7 @@
             "id": 3,
             "title": "Build Gemini orchestration loop with hard 5-step guard",
             "description": "Implement model-tool exchange loop that tracks current iteration and force-stops at loop 5 with deterministic final output.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "1",
               "2"
@@ -1118,7 +1162,7 @@
             "id": 4,
             "title": "Persist agent trace logs for loop and tool activity",
             "description": "Record loop counters, tool invocations, outcomes, and termination reasons in trace logs for observability.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "3"
             ]
@@ -1127,7 +1171,7 @@
             "id": 5,
             "title": "Create mocked tests for loop guard and allowlist enforcement",
             "description": "Use mocked Gemini/tool calls to verify max-loop behavior, unauthorized tool rejection, and deterministic termination paths.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "2",
               "3",
@@ -1159,14 +1203,14 @@
             "id": 1,
             "title": "Define extraction schema contract and provenance requirements",
             "description": "Document required output fields, per-field source offsets, and validation rules for accepted/rejected records.",
-            "status": "pending",
+            "status": "done",
             "dependencies": []
           },
           {
             "id": 2,
             "title": "Implement LangExtract adapter and request shaping",
             "description": "Add extractor integration layer that submits schema-guided prompts and normalizes provider responses.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "1"
             ]
@@ -1175,7 +1219,7 @@
             "id": 3,
             "title": "Implement validation pipeline for JSON and source offsets",
             "description": "Validate types, required fields, and provenance; reject unsupported claims lacking offsets/evidence references.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "1",
               "2"
@@ -1185,7 +1229,7 @@
             "id": 4,
             "title": "Add normalized success/error envelopes with diagnostics",
             "description": "Return consistent API-facing result objects containing accepted records, rejected records, and validation error details.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "3"
             ]
@@ -1194,7 +1238,7 @@
             "id": 5,
             "title": "Create mocked extractor tests for valid/invalid outputs",
             "description": "Mock LangExtract responses to verify schema enforcement, provenance checks, and deterministic error reporting.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "2",
               "3",
@@ -1206,7 +1250,7 @@
             "id": 6,
             "title": "Add Tier 4 token-estimation and budget guard checks",
             "description": "Estimate token volume before LangExtract runs, enforce configurable budget/rate thresholds, and fail fast to controlled partial/error states when limits are exceeded.",
-            "status": "pending",
+            "status": "done",
             "dependencies": [
               "2"
             ]
@@ -1360,7 +1404,11 @@
             ]
           }
         ],
-        "aocPrd": null,
+        "aocPrd": {
+          "path": ".taskmaster/docs/prd.txt",
+          "updatedAt": "2026-02-13T14:03:52Z",
+          "version": 1
+        },
         "updatedAt": "2026-02-12T12:05:09.161Z",
         "activeAgent": false
       }

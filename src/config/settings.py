@@ -85,9 +85,9 @@ class Settings(BaseSettings):
     local_embedding_provider: Literal["hash", "ollama"] = "ollama"
     local_embedding_model: str = "all-MiniLM-L6-v2"
     local_embedding_dimension: PositiveInt = 384
-    cloud_embedding_provider: Literal["hash", "gemini"] = "gemini"
-    cloud_embedding_model: str = "gemini-embedding-001"
-    cloud_embedding_dimension: PositiveInt = 3072
+    cloud_embedding_provider: Literal["hash", "ollama", "gemini"] = "ollama"
+    cloud_embedding_model: str = "all-MiniLM-L6-v2"
+    cloud_embedding_dimension: PositiveInt = 384
 
     docling_enabled: bool = True
     google_parser_enabled: bool = True

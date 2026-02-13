@@ -77,14 +77,19 @@ Observability endpoints:
 docker compose up --build
 ```
 
-By default, compose runs deep mode with local provider settings for full-feature
-UI coverage:
+By default, compose runs with local-first settings for full-feature
+UI coverage without requiring API keys:
 
 - `DEEP_MODE_ENABLED=true`
 - `CLOUD_AGENT_PROVIDER=local`
+- `LOCAL_EMBEDDING_PROVIDER=ollama`
+- `CLOUD_EMBEDDING_PROVIDER=ollama`
+- `EMBEDDING_ROLLOUT_MODE=provider`
 
-To use Gemini instead, set `CLOUD_AGENT_PROVIDER=gemini` and provide
-`CLOUD_AGENT_API_KEY`.
+To use Gemini for deep mode or cloud embeddings instead, set:
+
+- `CLOUD_AGENT_PROVIDER=gemini` and provide `CLOUD_AGENT_API_KEY`
+- `CLOUD_EMBEDDING_PROVIDER=gemini` (requires `CLOUD_AGENT_API_KEY`)
 
 ## Setup (Docker dev overlay, fast iteration)
 
