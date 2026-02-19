@@ -57,14 +57,53 @@ def test_settings_accepts_enabled_deep_mode_with_local_provider() -> None:
     assert cfg.cloud_agent_provider == "local"
 
 
-def test_settings_rejects_gemini_provider_without_api_key() -> None:
+def test_settings_rejects_gemini_provider_without_api_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CLOUD_AGENT_API_KEY", raising=False)
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)
+
     with pytest.raises(ValidationError):
-        Settings(cloud_agent_provider="gemini")
+        Settings(cloud_agent_provider="gemini", cloud_agent_api_key="")
 
 
 def test_settings_accepts_gemini_provider_with_api_key() -> None:
     cfg = Settings(cloud_agent_provider="gemini", cloud_agent_api_key="test-key")
     assert cfg.cloud_agent_provider == "gemini"
+
+
+def test_settings_supports_google_api_key_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CLOUD_AGENT_API_KEY", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "alias-key")
+
+    cfg = Settings()
+
+    assert cfg.cloud_agent_api_key == "alias-key"
+
+
+def test_settings_prefers_cloud_agent_api_key_over_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("CLOUD_AGENT_API_KEY", "canonical-key")
+    monkeypatch.setenv("GOOGLE_API_KEY", "alias-key")
+
+    cfg = Settings()
+
+    assert cfg.cloud_agent_api_key == "canonical-key"
+
+
+def test_settings_accepts_gemini_provider_with_google_api_key_alias(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("CLOUD_AGENT_API_KEY", raising=False)
+    monkeypatch.setenv("GOOGLE_API_KEY", "alias-key")
+
+    cfg = Settings(cloud_agent_provider="gemini")
+
+    assert cfg.cloud_agent_provider == "gemini"
+    assert cfg.cloud_agent_api_key == "alias-key"
 
 
 def test_settings_rejects_retry_initial_backoff_above_max() -> None:

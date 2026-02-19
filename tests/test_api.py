@@ -168,6 +168,23 @@ class FailingCloudAgentEngine(StubCloudAgentEngine):
         )
 
 
+class ParsedArtifactMissingCloudAgentEngine(StubCloudAgentEngine):
+    def ask(self, question: str, mode: Mode, document_id: str | None) -> ChatResponse:
+        self.calls.append((question, mode, document_id))
+        return ChatResponse(
+            answer="Re-ingest required",
+            mode=mode,
+            document_id=document_id,
+            insufficient_evidence=True,
+            citations=[],
+            trace=AgentTrace(
+                model="gemini-2.5-flash",
+                iterations=0,
+                termination_reason="parsed_artifact_missing",
+            ),
+        )
+
+
 class StubStructuredExtractor:
     def __init__(self, envelope: StructuredExtractionEnvelope) -> None:
         self.envelope = envelope
@@ -252,6 +269,56 @@ class AlwaysFailOrchestrator:
         raise RuntimeError("poison ingestion payload")
 
 
+class FlakyClaimStateStore:
+    def __init__(self, delegate: InMemoryApiStateStore) -> None:
+        self._delegate = delegate
+        self._failed = False
+
+    async def get_idempotency_response(self, key: str) -> IngestResponse | None:
+        return await self._delegate.get_idempotency_response(key)
+
+    async def claim_idempotency_key(self, key: str) -> bool:
+        if key.startswith("queue:doc:") and not self._failed:
+            self._failed = True
+            raise RuntimeError("transient claim failure")
+        return await self._delegate.claim_idempotency_key(key)
+
+    async def put_idempotency_response(
+        self, key: str, response: IngestResponse
+    ) -> None:
+        await self._delegate.put_idempotency_response(key, response)
+
+    async def release_idempotency_key(self, key: str) -> None:
+        await self._delegate.release_idempotency_key(key)
+
+    async def get_ingestion_record(self, document_id: str) -> IngestResponse | None:
+        return await self._delegate.get_ingestion_record(document_id)
+
+    async def put_ingestion_record(self, response: IngestResponse) -> None:
+        await self._delegate.put_ingestion_record(response)
+
+    async def get_session_history(self, key: str) -> list[dict[str, str]]:
+        return await self._delegate.get_session_history(key)
+
+    async def append_session_turn(
+        self,
+        *,
+        key: str,
+        question: str,
+        answer: str,
+        max_turns: int,
+    ) -> None:
+        await self._delegate.append_session_turn(
+            key=key,
+            question=question,
+            answer=answer,
+            max_turns=max_turns,
+        )
+
+    async def close(self) -> None:
+        await self._delegate.close()
+
+
 def _make_services(
     *,
     tmp_path: Path,
@@ -288,6 +355,7 @@ def _make_services(
         ingestion_worker_concurrency=ingestion_worker_concurrency,
         deep_mode_enabled=deep_mode_enabled,
         cloud_agent_provider="fallback" if deep_mode_enabled else "disabled",
+        cloud_agent_api_key="",
         docling_enabled=docling_enabled,
         google_parser_enabled=google_parser_enabled,
         langextract_enabled=langextract_enabled,
@@ -523,9 +591,10 @@ def test_healthz_reports_optional_capability_diagnostics(
     capabilities = response.json()["capabilities"]
     assert capabilities["docling_parser"]["ready"] is False
     assert capabilities["docling_parser"]["reason"] == "missing_dependency"
-    assert "pip install -e .[ai]" in capabilities["docling_parser"]["hint"]
+    assert "pip install -e .[ai-docling]" in capabilities["docling_parser"]["hint"]
     assert capabilities["google_parser"]["ready"] is False
     assert capabilities["google_parser"]["reason"] == "missing_api_key"
+    assert "GOOGLE_API_KEY" in capabilities["google_parser"]["hint"]
     assert capabilities["langextract_extractor"]["ready"] is False
     assert capabilities["langextract_extractor"]["reason"] == "missing_dependency"
 
@@ -574,7 +643,7 @@ def test_runtime_capability_logging_warns_when_dependency_missing(
     assert (
         "Runtime capability docling_parser => enabled=True ready=False" in caplog.text
     )
-    assert "pip install -e .[ai]" in caplog.text
+    assert "pip install -e .[ai-docling]" in caplog.text
 
 
 def test_healthz_marks_google_parser_disabled_by_config(tmp_path: Path) -> None:
@@ -587,6 +656,23 @@ def test_healthz_marks_google_parser_disabled_by_config(tmp_path: Path) -> None:
     capabilities = response.json()["capabilities"]
     assert capabilities["google_parser"]["enabled"] is False
     assert capabilities["google_parser"]["reason"] == "disabled_by_config"
+
+
+def test_healthz_marks_parser_steps_excluded_by_routing_mode(tmp_path: Path) -> None:
+    services = _make_services(
+        tmp_path=tmp_path,
+        parser_routing_mode="fallback_only",
+    )
+
+    with _client_with_services(services) as client:
+        response = client.get("/healthz")
+
+    assert response.status_code == 200
+    capabilities = response.json()["capabilities"]
+    assert capabilities["docling_parser"]["enabled"] is False
+    assert capabilities["docling_parser"]["reason"] == "excluded_by_routing_mode"
+    assert capabilities["google_parser"]["enabled"] is False
+    assert capabilities["google_parser"]["reason"] == "excluded_by_routing_mode"
 
 
 def test_metrics_endpoint_exposes_http_and_qa_counters(tmp_path: Path) -> None:
@@ -655,6 +741,91 @@ def test_readyz_returns_503_when_index_backend_is_degraded(tmp_path: Path) -> No
     body = response.json()
     assert body["overall"] == "degraded"
     assert body["index"]["backend"] == "InMemoryIndexBackend"
+
+
+def test_healthz_readiness_actions_surface_deep_mode_blockers(tmp_path: Path) -> None:
+    services = _make_services(tmp_path=tmp_path, deep_mode_enabled=False)
+
+    with _client_with_services(services) as client:
+        response = client.get("/healthz")
+
+    assert response.status_code == 200
+    readiness = response.json()["readiness"]
+    assert readiness["actions"]["ask_fast"]["ready"] is True
+    assert readiness["actions"]["ask_deep"]["ready"] is False
+    deep_issues = readiness["actions"]["ask_deep"]["blocking_issues"]
+    assert deep_issues[0]["code"] == "deep_mode_disabled"
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "profile_kwargs"),
+    [
+        (
+            "lite",
+            {
+                "docling_enabled": False,
+                "google_parser_enabled": False,
+                "langextract_enabled": False,
+                "parser_routing_mode": "fallback_only",
+            },
+        ),
+        (
+            "full",
+            {
+                "docling_enabled": True,
+                "google_parser_enabled": False,
+                "langextract_enabled": True,
+                "parser_routing_mode": "docling_google_fallback",
+            },
+        ),
+    ],
+)
+def test_profile_smoke_upload_ingest_and_ask_fast_deep(
+    tmp_path: Path,
+    profile_name: str,
+    profile_kwargs: dict[str, Any],
+) -> None:
+    del profile_name
+    services = _make_services(
+        tmp_path=tmp_path,
+        orchestrator=StubOrchestrator(status=IngestionStatus.INDEXED),
+        **profile_kwargs,
+    )
+
+    with _client_with_services(services) as client:
+        upload_response = client.post(
+            "/upload",
+            files={"file": ("invoice.pdf", b"%PDF-1.4\ninvoice", "application/pdf")},
+        )
+
+        assert upload_response.status_code == 201
+        document_id = upload_response.json()["document_id"]
+
+        _wait_for_ingest_status(
+            client,
+            document_id=document_id,
+            expected=IngestionStatus.INDEXED,
+        )
+
+        fast_response = client.post(
+            "/ask",
+            json={
+                "question": "What is due?",
+                "mode": "fast",
+                "document_id": document_id,
+            },
+        )
+        deep_response = client.post(
+            "/ask",
+            json={
+                "question": "What is due?",
+                "mode": "deep",
+                "document_id": document_id,
+            },
+        )
+
+    assert fast_response.status_code == 200
+    assert deep_response.status_code == 200
 
 
 def test_build_default_services_fails_fast_in_prod_when_redis_unavailable(
@@ -975,6 +1146,48 @@ def test_ingest_queue_dead_letters_poison_payload_after_retry_exhaustion(
     assert queue_report["dead_letter_jobs"] >= 1
 
 
+def test_ingest_queue_recovers_from_worker_loop_crash_without_losing_job(
+    tmp_path: Path,
+) -> None:
+    orchestrator = StubOrchestrator(status=IngestionStatus.INDEXED)
+    base_store = InMemoryApiStateStore(
+        idempotency_ttl_seconds=24 * 60 * 60,
+        ingestion_ttl_seconds=30 * 24 * 60 * 60,
+        session_ttl_seconds=7 * 24 * 60 * 60,
+        idempotency_claim_ttl_seconds=5 * 60,
+    )
+    services = _make_services(
+        tmp_path=tmp_path,
+        orchestrator=orchestrator,
+        state_store=cast(Any, FlakyClaimStateStore(base_store)),
+        ingestion_queue_max_retries=2,
+        ingestion_queue_retry_backoff_seconds=0.0,
+    )
+
+    with _client_with_services(services) as client:
+        response = client.post(
+            "/ingest",
+            files={
+                "file": (
+                    "invoice.pdf",
+                    b"%PDF-1.4\ninvoice",
+                    "application/pdf",
+                )
+            },
+        )
+
+        assert response.status_code == 201
+        body = response.json()
+        final = _wait_for_ingest_status(
+            client,
+            document_id=body["document_id"],
+            expected=IngestionStatus.INDEXED,
+        )
+
+    assert final["status"] == "indexed"
+    assert len(orchestrator.calls) >= 1
+
+
 def test_ingest_unsupported_type_returns_normalized_error(tmp_path: Path) -> None:
     services = _make_services(tmp_path=tmp_path)
 
@@ -1191,6 +1404,29 @@ def test_ask_deep_mode_returns_deterministic_provider_error_envelope(
     body = response.json()
     assert body["code"] == "provider_timeout"
     assert body["message"] == "deep mode provider request failed"
+
+
+def test_ask_deep_mode_allows_parsed_artifact_missing_as_non_500(
+    tmp_path: Path,
+) -> None:
+    local = StubLocalQAEngine()
+    cloud = ParsedArtifactMissingCloudAgentEngine()
+    services = _make_services(tmp_path=tmp_path, local_qa=local, cloud_agent=cloud)
+
+    with _client_with_services(services) as client:
+        response = client.post(
+            "/ask",
+            json={
+                "question": "Find cancellation clause",
+                "mode": "deep",
+                "document_id": "doc-2",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["insufficient_evidence"] is True
+    assert body["trace"]["termination_reason"] == "parsed_artifact_missing"
 
 
 def test_ask_with_session_id_reuses_previous_turn_context(tmp_path: Path) -> None:

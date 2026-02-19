@@ -44,10 +44,12 @@ class BestEffortParser:
         docling_enabled: bool = True,
         google_enabled: bool = True,
         parser_order: tuple[str, ...] | None = None,
+        parsed_dir: Path | None = None,
     ) -> None:
         self._docling_parser = docling_parser or Tier2DoclingParser()
         self._google_parser = google_parser or Tier2GoogleParser()
         self._fallback_extractor = fallback_extractor or BestEffortTextExtractor()
+        self._parsed_dir = parsed_dir
         self._parser_order = _resolve_parser_order(
             parser_order=parser_order,
             docling_enabled=docling_enabled,
@@ -63,23 +65,31 @@ class BestEffortParser:
                         document_id=document_id,
                         file_path=file_path,
                     )
-                    return _normalize_parsed_document(
-                        parsed=parsed, parser_name="docling"
+                    normalized = _normalize_parsed_document(
+                        parsed=parsed,
+                        parser_name="docling",
                     )
+                    self._persist_parsed_markdown(normalized)
+                    return normalized
 
                 if parser_name == "google":
                     parsed = self._google_parser.parse(
                         document_id=document_id,
                         file_path=file_path,
                     )
-                    return _normalize_parsed_document(
-                        parsed=parsed, parser_name="google"
+                    normalized = _normalize_parsed_document(
+                        parsed=parsed,
+                        parser_name="google",
                     )
+                    self._persist_parsed_markdown(normalized)
+                    return normalized
 
                 if parser_name == "fallback":
-                    return self._fallback_parse(
+                    parsed = self._fallback_parse(
                         document_id=document_id, file_path=file_path
                     )
+                    self._persist_parsed_markdown(parsed)
+                    return parsed
             except Exception as exc:
                 attempts.append((parser_name, str(exc)))
 
@@ -130,6 +140,18 @@ class BestEffortParser:
             blocks=[block],
             parser_name="fallback",
         )
+
+    def _persist_parsed_markdown(self, parsed: ParsedMarkdownDocument) -> None:
+        if self._parsed_dir is None:
+            return
+
+        safe_document_id = Path(parsed.document_id).name
+        if safe_document_id != parsed.document_id:
+            raise RuntimeError("invalid document_id for parsed artifact path")
+
+        self._parsed_dir.mkdir(parents=True, exist_ok=True)
+        artifact_path = self._parsed_dir / f"{safe_document_id}.md"
+        artifact_path.write_text(parsed.markdown, encoding="utf-8")
 
 
 class ProviderIngestionEmbedder:

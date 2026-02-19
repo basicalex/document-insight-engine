@@ -30,8 +30,14 @@ ui = [
   "streamlit>=1.41,<2.0",
 ]
 ai = [
-  "docling>=2.40,<3.0",
   "langextract>=1.1,<2.0",
+  "docling>=2.40,<3.0",
+]
+ai-lite = [
+  "langextract>=1.1,<2.0",
+]
+ai-docling = [
+  "docling>=2.40,<3.0",
 ]
 
 [tool.setuptools.packages.find]

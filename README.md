@@ -32,100 +32,70 @@ See `tests/data/documents/`:
 
 These are synthetic fixtures and contain no sensitive data.
 
-## Setup (manual)
+## Runtime profiles
+
+Runtime behavior is profile-driven and shared by local hybrid and Docker:
+
+- `.env.profile.lite` (default): no Docling, no Google parser, fallback-only parser routing, LangExtract disabled.
+- `.env.profile.full` (opt-in): Docling + LangExtract enabled, Google parser optional when key is present.
+- `.env`: secrets only (`CLOUD_AGENT_API_KEY`, `GOOGLE_API_KEY`).
+
+## Setup (hybrid local API/UI + Docker infra)
+
+Lite profile (recommended default):
 
 ```bash
-python -m pip install -e .[dev]
-python -m pytest
-uvicorn src.api.main:app --host 0.0.0.0 --port 8000
+./scripts/dev-lite-up.sh
 ```
 
-Optional AI parsing/extraction runtime (Docling + LangExtract):
+Full profile:
 
 ```bash
-python -m pip install -e .[ai]
+./scripts/dev-full-up.sh
 ```
 
-Run Streamlit UI (in another terminal):
+Both scripts:
+
+- install profile-matched extras (`.[dev,ui,ai-lite]` for lite, `.[dev,ui,ai]` for full)
+- start `redis` + `ollama` in Docker
+- stop Docker `api`/`ui` if they are running (to avoid port conflicts)
+- run local API (`:8000`) + UI (`:8501`)
+
+## Setup (full Docker)
+
+Lite profile:
 
 ```bash
-python -m pip install -e .[ui]
-streamlit run frontend/app.py
+./scripts/docker-lite-up.sh
 ```
 
-Health check:
+Full profile:
 
 ```bash
-curl http://localhost:8000/healthz
+./scripts/docker-full-up.sh
 ```
 
-`/healthz` now reports optional capability diagnostics for Docling and
-LangExtract under `capabilities`, including `enabled`, `ready`, and
-actionable `hint` values when dependencies are missing or disabled.
+Compose consumes `${DIE_PROFILE_ENV_FILE:-.env.profile.lite}` for runtime knobs, while `.env` supplies secrets.
 
-Observability endpoints:
+Build caching notes:
 
-- `GET /metrics` exposes Prometheus-style counters/gauges for HTTP latency,
-  ingestion retries/dead letters, insufficient-evidence rate, and citation
-  completeness.
-- `GET /healthz` now includes an `observability` snapshot and SLO pass/fail
-  checks.
-
-## Setup (Docker)
-
-```bash
-docker compose up --build
-```
-
-By default, compose runs with local-first settings for full-feature
-UI coverage without requiring API keys:
-
-- `DEEP_MODE_ENABLED=true`
-- `CLOUD_AGENT_PROVIDER=local`
-- `LOCAL_EMBEDDING_PROVIDER=ollama`
-- `CLOUD_EMBEDDING_PROVIDER=ollama`
-- `EMBEDDING_ROLLOUT_MODE=provider`
-
-To use Gemini for deep mode or cloud embeddings instead, set:
-
-- `CLOUD_AGENT_PROVIDER=gemini` and provide `CLOUD_AGENT_API_KEY`
-- `CLOUD_EMBEDDING_PROVIDER=gemini` (requires `CLOUD_AGENT_API_KEY`)
-
-## Setup (Docker dev overlay, fast iteration)
-
-Use the dev overlay to avoid rebuilding on every code change. It bind-mounts
-`src/` and `frontend/` into containers and runs API with `--reload`.
-
-Start infra once:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d redis ollama
-```
-
-Run API + UI in dev mode:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d api ui
-```
-
-View logs while developing:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml logs -f api ui
-```
-
-Rebuild is only needed when dependencies or Dockerfile layers change:
-
-```bash
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d --build api ui
-```
+- The Dockerfile installs third-party dependencies before copying `src/` and `frontend/`, so source-only edits do not invalidate heavy dependency layers.
+- Default Docker build installs `ui` + `ai-lite` (LangExtract, no Docling).
+- `INSTALL_DOCLING=true` includes `ai-docling` dependencies.
+- BuildKit cache mounts are enabled for apt and pip layers, so dependency downloads are reused across rebuilds when metadata has not changed.
 
 Services started by compose:
 
 - `api` (FastAPI)
-- `ui` (Streamlit, available at `http://localhost:8501`)
+- `ui` (Streamlit at `http://localhost:8501`)
 - `redis` (persistent volume)
-- `ollama` (model cache mounted under `./models`)
+- `ollama` (model cache under `./models`)
+
+Health and observability endpoints:
+
+- `GET /healthz` includes index readiness, action-specific blockers, deep-provider diagnostics, optional capability notices, and observability snapshot.
+- `GET /readyz` returns `200` only when index backend is ready; degraded mode returns `503`.
+- `GET /metrics` exposes Prometheus-style counters/gauges for latency, queue retries/dead letters, insufficient-evidence rate, and citation completeness.
 
 ## API status and contracts
 
@@ -146,11 +116,14 @@ Deep mode capability:
 - Deep mode is disabled by default at runtime.
 - Enable with env vars:
   - local deep agent: `DEEP_MODE_ENABLED=true` and `CLOUD_AGENT_PROVIDER=local`
-  - Gemini deep agent: `DEEP_MODE_ENABLED=true`, `CLOUD_AGENT_PROVIDER=gemini`, and `CLOUD_AGENT_API_KEY=...`
+  - Gemini deep agent: `DEEP_MODE_ENABLED=true`, `CLOUD_AGENT_PROVIDER=gemini`, and `CLOUD_AGENT_API_KEY=...` (or `GOOGLE_API_KEY=...`)
 
 Full-feature runtime profile:
 
-- Install optional dependencies: `python -m pip install -e .[ai,ui,dev]`
+- Install optional dependencies for no-Docling local runtime:
+  `python -m pip install -e .[ai-lite,ui,dev]`
+- Install optional dependencies for full parser stack:
+  `python -m pip install -e .[ai,ui,dev]`
 - Keep Redis and Ollama running (`docker compose up -d redis ollama` or equivalent)
 - For local deep mode via Ollama:
   - `DEEP_MODE_ENABLED=true`
@@ -158,7 +131,7 @@ Full-feature runtime profile:
 - For Gemini deep mode + Google parser routing:
   - `DEEP_MODE_ENABLED=true`
   - `CLOUD_AGENT_PROVIDER=gemini`
-  - `CLOUD_AGENT_API_KEY=<your key>`
+  - `CLOUD_AGENT_API_KEY=<your key>` (or `GOOGLE_API_KEY=<your key>`)
 - For structured extraction with LangExtract:
   - `LANGEXTRACT_ENABLED=true` (default)
   - ensure `langextract` package/runtime credentials are available
@@ -170,8 +143,10 @@ Full-feature runtime profile:
 Parser routing capability:
 
 - Runtime parser chain is configurable with `PARSER_ROUTING_MODE`.
-- Default order is `docling -> google -> fallback` (`docling_google_fallback`).
-- Google parser step requires `CLOUD_AGENT_API_KEY`; otherwise routing falls through to fallback parser.
+- Default Docker order is `fallback_only` to avoid optional parser dependencies.
+- Full parser order is `docling -> google -> fallback` (`docling_google_fallback`).
+- Google parser step requires `CLOUD_AGENT_API_KEY` (or `GOOGLE_API_KEY`); otherwise routing falls through to fallback parser.
+- Successful ingest persists parser output to `data/parsed/<document_id>.md` for deep-mode filesystem tools.
 
 Index backend policy:
 

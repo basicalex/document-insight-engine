@@ -255,6 +255,12 @@ def _decode_response(response: httpx.Response) -> dict[str, Any]:
 def _safe_json(response: httpx.Response) -> Any:
     try:
         return response.json()
+    except httpx.ResponseNotRead:
+        response.read()
+        try:
+            return response.json()
+        except ValueError:
+            return {}
     except ValueError:
         return {}
 

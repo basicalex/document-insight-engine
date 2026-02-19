@@ -169,3 +169,37 @@ def test_cloud_agent_rejects_malformed_provider_payload() -> None:
     assert response.trace is not None
     assert response.trace.iterations == 1
     assert response.trace.termination_reason == "provider_malformed_response"
+
+
+def test_cloud_agent_handles_missing_parsed_artifact_without_crashing() -> None:
+    model = ScriptedModel(
+        steps=[
+            {
+                "action": "final",
+                "answer": "unused",
+                "insufficient_evidence": False,
+            }
+        ]
+    )
+
+    def broken_tool_provider(_document_id: str) -> dict[str, Any]:
+        raise FileNotFoundError("no parsed markdown found for document")
+
+    engine = CloudAgentEngine(
+        model_client=model,
+        tool_provider=broken_tool_provider,
+    )
+
+    response = engine.ask(
+        question="Find contradictions.",
+        mode=Mode.DEEP,
+        document_id="doc-missing",
+    )
+
+    assert response.insufficient_evidence is True
+    assert "Re-ingest the document" in response.answer
+    assert response.trace is not None
+    assert response.trace.iterations == 0
+    assert response.trace.termination_reason == "parsed_artifact_missing"
+    assert response.trace.tool_calls[0].metadata["code"] == "parsed_artifact_missing"
+    assert len(model.calls) == 0

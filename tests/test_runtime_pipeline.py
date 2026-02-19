@@ -219,6 +219,24 @@ def test_best_effort_parser_respects_routing_order_override(tmp_path: Path) -> N
     assert parsed.parser_name == "google"
 
 
+def test_best_effort_parser_persists_parsed_markdown_artifact(tmp_path: Path) -> None:
+    file_path = tmp_path / "persist.pdf"
+    file_path.write_bytes(b"ignored")
+    parsed_dir = tmp_path / "parsed"
+    parser = BestEffortParser(
+        docling_parser=SuccessfulParser("docling"),
+        fallback_extractor=FixedExtractor(),
+        google_enabled=False,
+        parsed_dir=parsed_dir,
+    )
+
+    parsed = parser.parse(document_id="doc-6", file_path=file_path)
+
+    artifact_path = parsed_dir / "doc-6.md"
+    assert artifact_path.exists()
+    assert artifact_path.read_text(encoding="utf-8") == parsed.markdown
+
+
 def test_hashing_ingestion_embedder_creates_tier_records() -> None:
     parent = ParentChunk(
         chunk_id="par-1",

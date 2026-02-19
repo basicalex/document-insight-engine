@@ -281,6 +281,7 @@ def _build_default_services(cfg: Settings) -> ApiServices:
         docling_enabled=cfg.docling_enabled,
         google_enabled=cfg.google_parser_enabled,
         parser_order=_parser_order_for_mode(cfg.parser_routing_mode),
+        parsed_dir=cfg.parsed_dir,
     )
     chunker = ParentChildChunker()
     tier1_embed_client, tier4_embed_client = build_ingestion_embedding_clients(cfg)
@@ -1143,21 +1144,12 @@ async def _run_orchestration_with_timeout(
         )
 
     try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(
-                orchestrator.process,
-                document_id,
-                file_path,
-                mime_type,
-            ),
-            timeout=services.cfg.ingest_timeout_seconds,
+        return await asyncio.to_thread(
+            orchestrator.process,
+            document_id,
+            file_path,
+            mime_type,
         )
-    except asyncio.TimeoutError as exc:
-        raise ApiError(
-            code="ingest_pipeline_timeout",
-            message="ingestion pipeline timed out",
-            status_code=504,
-        ) from exc
     except Exception as exc:
         raise ApiError(
             code="ingest_pipeline_failed",
@@ -1422,11 +1414,7 @@ def _runtime_dependency_report() -> dict[str, bool]:
 
 def _runtime_capabilities_report(cfg: Settings) -> dict[str, dict[str, Any]]:
     return {
-        "docling_parser": _optional_capability_status(
-            enabled=cfg.docling_enabled,
-            module_name="docling",
-            package_name="docling",
-        ),
+        "docling_parser": _docling_parser_capability_status(cfg),
         "google_parser": _google_parser_capability_status(cfg),
         "langextract_extractor": _optional_capability_status(
             enabled=cfg.langextract_enabled,
@@ -1434,6 +1422,23 @@ def _runtime_capabilities_report(cfg: Settings) -> dict[str, dict[str, Any]]:
             package_name="langextract",
         ),
     }
+
+
+def _optional_dependency_hint(*, package_name: str) -> str:
+    extra_by_package = {
+        "docling": "ai-docling",
+        "langextract": "ai-lite",
+    }
+    extra = extra_by_package.get(package_name)
+    if extra is None:
+        return (
+            "install optional runtime dependency: "
+            f"pip install {package_name} (missing package: {package_name})"
+        )
+    return (
+        "install optional runtime dependency: "
+        f"pip install -e .[{extra}] (missing package: {package_name})"
+    )
 
 
 def _optional_capability_status(
@@ -1463,11 +1468,23 @@ def _optional_capability_status(
         "enabled": True,
         "ready": False,
         "reason": "missing_dependency",
-        "hint": (
-            f"install optional runtime dependencies: pip install -e .[ai] "
-            f"(missing package: {package_name})"
-        ),
+        "hint": _optional_dependency_hint(package_name=package_name),
     }
+
+
+def _docling_parser_capability_status(cfg: Settings) -> dict[str, Any]:
+    if not _parser_step_is_active(cfg, "docling"):
+        return {
+            "enabled": False,
+            "ready": False,
+            "reason": "excluded_by_routing_mode",
+            "hint": "set PARSER_ROUTING_MODE to include docling",
+        }
+    return _optional_capability_status(
+        enabled=cfg.docling_enabled,
+        module_name="docling",
+        package_name="docling",
+    )
 
 
 def _log_runtime_capabilities(cfg: Settings) -> None:
@@ -1487,6 +1504,14 @@ def _log_runtime_capabilities(cfg: Settings) -> None:
 
 
 def _google_parser_capability_status(cfg: Settings) -> dict[str, Any]:
+    if not _parser_step_is_active(cfg, "google"):
+        return {
+            "enabled": False,
+            "ready": False,
+            "reason": "excluded_by_routing_mode",
+            "hint": "set PARSER_ROUTING_MODE to include google",
+        }
+
     if not cfg.google_parser_enabled:
         return {
             "enabled": False,
@@ -1507,8 +1532,12 @@ def _google_parser_capability_status(cfg: Settings) -> dict[str, Any]:
         "enabled": True,
         "ready": False,
         "reason": "missing_api_key",
-        "hint": "set CLOUD_AGENT_API_KEY for Google parser routing",
+        "hint": "set CLOUD_AGENT_API_KEY (or GOOGLE_API_KEY) for Google parser routing",
     }
+
+
+def _parser_step_is_active(cfg: Settings, parser_name: str) -> bool:
+    return parser_name in _parser_order_for_mode(cfg.parser_routing_mode)
 
 
 def _parser_order_for_mode(mode: str) -> tuple[str, ...]:
@@ -1524,12 +1553,91 @@ def _parser_order_for_mode(mode: str) -> tuple[str, ...]:
 
 def _runtime_readiness_report(services: ApiServices) -> dict[str, Any]:
     index = dict(services.index_readiness)
+    capabilities = _runtime_capabilities_report(services.cfg)
+    deep_provider = _deep_provider_diagnostics(services.cfg)
+    ingest_blockers = _index_readiness_issues(index)
+    fast_blockers = list(ingest_blockers)
+    deep_blockers = list(fast_blockers)
+    deep_blockers.extend(_deep_mode_readiness_issues(services.cfg, deep_provider))
+
     overall = "degraded" if bool(index.get("degraded")) else "ready"
     return {
         "overall": overall,
         "environment": services.cfg.environment,
         "index": index,
+        "actions": {
+            "ingest": {
+                "ready": not ingest_blockers,
+                "blocking_issues": ingest_blockers,
+            },
+            "ask_fast": {
+                "ready": not fast_blockers,
+                "blocking_issues": fast_blockers,
+            },
+            "ask_deep": {
+                "ready": not deep_blockers,
+                "blocking_issues": deep_blockers,
+            },
+        },
+        "optional_capability_issues": _optional_capability_issues(capabilities),
     }
+
+
+def _index_readiness_issues(index: dict[str, Any]) -> list[dict[str, str]]:
+    if not bool(index.get("degraded")):
+        return []
+
+    reason = str(index.get("reason") or "index_degraded")
+    return [
+        {
+            "code": "index_backend_not_ready",
+            "message": f"index backend is degraded ({reason})",
+        }
+    ]
+
+
+def _deep_mode_readiness_issues(
+    cfg: Settings,
+    deep_provider: dict[str, Any],
+) -> list[dict[str, str]]:
+    if not cfg.deep_mode_enabled:
+        return [
+            {
+                "code": "deep_mode_disabled",
+                "message": "deep mode is disabled by configuration",
+            }
+        ]
+
+    if bool(deep_provider.get("ready")):
+        return []
+
+    reason = str(deep_provider.get("reason") or "provider_unavailable")
+    return [
+        {
+            "code": "deep_provider_not_ready",
+            "message": f"deep provider is not ready ({reason})",
+        }
+    ]
+
+
+def _optional_capability_issues(
+    capabilities: dict[str, dict[str, Any]],
+) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    for name, report in capabilities.items():
+        if not bool(report.get("enabled")) or bool(report.get("ready")):
+            continue
+        reason = str(report.get("reason") or "not_ready")
+        hint = str(report.get("hint") or "").strip()
+        issue = {
+            "capability": name,
+            "reason": reason,
+            "message": f"{name} not ready ({reason})",
+        }
+        if hint:
+            issue["hint"] = hint
+        issues.append(issue)
+    return issues
 
 
 def _deep_provider_diagnostics(cfg: Settings) -> dict[str, Any]:

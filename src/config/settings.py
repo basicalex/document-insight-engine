@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Literal
 
 from pydantic import (
+    AliasChoices,
     Field,
     PositiveInt,
     ValidationError,
@@ -76,7 +77,7 @@ class Settings(BaseSettings):
     eval_max_p95_latency_ms: PositiveInt = 2500
 
     ollama_base_url: str = "http://ollama:11434"
-    local_llm_model: str = "llama3.2:1b"
+    local_llm_model: str = "hadad/LFM2.5-1.2B:Q8_0"
     embedding_rollout_mode: Literal[
         "hash", "provider", "provider_with_hash_fallback"
     ] = "provider_with_hash_fallback"
@@ -108,7 +109,14 @@ class Settings(BaseSettings):
         "disabled"
     )
     cloud_agent_model: str = "gemini-2.5-flash"
-    cloud_agent_api_key: str | None = None
+    cloud_agent_api_key: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "cloud_agent_api_key",
+            "CLOUD_AGENT_API_KEY",
+            "GOOGLE_API_KEY",
+        ),
+    )
     cloud_agent_api_base_url: str = "https://generativelanguage.googleapis.com"
     cloud_agent_timeout_seconds: PositiveInt = 30
     cloud_agent_retry_attempts: int = Field(default=3, ge=1, le=10)

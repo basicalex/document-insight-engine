@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import time
 from typing import Any
 
 import streamlit as st
 
 from frontend.client import ApiError, DocumentInsightApi
+from frontend.readiness import classify_runtime_readiness
 from frontend.state import (
     DEFAULT_API_BASE_URL,
     append_assistant_message,
@@ -130,11 +132,7 @@ def _render_status_bar() -> None:
     status_cols[1].metric("Document", active_document)
 
     status_cols[2].metric("Turns", str(len(st.session_state["messages"])))
-    latest_ingest_status = (
-        st.session_state["ingest_history"][-1]["status"]
-        if st.session_state["ingest_history"]
-        else "n/a"
-    )
+    latest_ingest_status = _latest_ingest_status_for_document(active_document)
     runtime = st.session_state.get("runtime_health") or {}
     runtime_status = str(
         runtime.get("readiness", {}).get("overall")
@@ -168,7 +166,12 @@ def _handle_upload(uploaded_files: list[Any]) -> None:
 
     records = _normalize_upload_response(response)
     for item in records:
-        st.session_state["ingest_history"].append(item)
+        _upsert_ingest_history_record(
+            document_id=str(item.get("document_id") or "").strip(),
+            status=str(item.get("status") or "").strip(),
+            message=str(item.get("message") or "").strip(),
+            file_path=str(item.get("file_path") or "").strip(),
+        )
 
     if records:
         latest = records[-1]
@@ -190,13 +193,11 @@ def _refresh_ingest_status(document_id: str) -> None:
                 st.error(_format_api_error(exc))
                 return
 
-    st.session_state["ingest_history"].append(
-        {
-            "document_id": response.get("document_id"),
-            "status": response.get("status"),
-            "message": response.get("message"),
-            "file_path": response.get("file_path"),
-        }
+    _upsert_ingest_history_record(
+        document_id=str(response.get("document_id") or "").strip(),
+        status=str(response.get("status") or "").strip(),
+        message=str(response.get("message") or "").strip(),
+        file_path=str(response.get("file_path") or "").strip(),
     )
 
 
@@ -254,24 +255,19 @@ def _render_runtime_readiness_banner() -> None:
         )
         return
 
-    issues: list[str] = []
     chat_mode = st.session_state.get("chat_mode", "fast")
-    deep_provider = runtime.get("deep_provider") or {}
-    if chat_mode == "deep" and not bool(deep_provider.get("ready", False)):
-        issues.append(
-            f"deep provider is not ready ({deep_provider.get('reason', 'unknown')})"
-        )
+    blocking_issues, optional_notices = classify_runtime_readiness(
+        runtime=runtime,
+        chat_mode=str(chat_mode),
+    )
 
-    capabilities = runtime.get("capabilities") or {}
-    for name, capability in capabilities.items():
-        if not isinstance(capability, dict):
-            continue
-        if bool(capability.get("enabled")) and not bool(capability.get("ready")):
-            issues.append(f"{name} not ready ({capability.get('reason', 'unknown')})")
+    if blocking_issues:
+        st.error("Blocking issues for current action: " + "; ".join(blocking_issues))
 
-    if issues:
-        st.warning("Runtime readiness issues: " + "; ".join(issues))
-    else:
+    if optional_notices:
+        st.info("Optional capability notices: " + "; ".join(optional_notices))
+
+    if not blocking_issues and not optional_notices:
         st.success("Runtime readiness looks good for active capabilities.")
 
 
@@ -324,29 +320,50 @@ def _handle_chat_prompt() -> None:
     with st.chat_message("assistant"):
         answer_placeholder = st.empty()
         answer_placeholder.markdown("_Starting response..._")
+        active_document_id = st.session_state["active_document_id"] or None
         try:
             with DocumentInsightApi(base_url=st.session_state["api_base_url"]) as api:
                 try:
-                    response = _consume_streamed_response(
-                        events=api.ask_stream_events(
-                            question=prompt,
-                            mode=st.session_state["chat_mode"],
-                            document_id=st.session_state["active_document_id"] or None,
-                            session_id=st.session_state["session_id"] or None,
-                        ),
+                    response = _request_chat_response(
+                        api=api,
+                        prompt=prompt,
+                        document_id=active_document_id,
+                        session_id=st.session_state["session_id"] or None,
+                        chat_mode=st.session_state["chat_mode"],
                         placeholder=answer_placeholder,
-                        mode=st.session_state["chat_mode"],
-                        document_id=st.session_state["active_document_id"] or None,
                     )
-                except ApiError as stream_error:
-                    if stream_error.status_code == 404:
-                        response = api.ask(
-                            question=prompt,
-                            mode=st.session_state["chat_mode"],
-                            document_id=st.session_state["active_document_id"] or None,
-                            session_id=st.session_state["session_id"] or None,
+                except ApiError as chat_error:
+                    if active_document_id and _is_document_not_ready_error(chat_error):
+                        answer_placeholder.markdown(
+                            "_Document is still indexing. Waiting for readiness..._"
                         )
-                        answer_placeholder.markdown(str(response.get("answer", "")))
+                        status_payload = _wait_for_document_indexed(
+                            api=api,
+                            document_id=active_document_id,
+                            placeholder=answer_placeholder,
+                        )
+                        status = str(status_payload.get("status", "")).strip().lower()
+                        if status == "indexed":
+                            response = _request_chat_response(
+                                api=api,
+                                prompt=prompt,
+                                document_id=active_document_id,
+                                session_id=st.session_state["session_id"] or None,
+                                chat_mode=st.session_state["chat_mode"],
+                                placeholder=answer_placeholder,
+                            )
+                        else:
+                            status_text = str(status_payload.get("status") or "unknown")
+                            raise ApiError(
+                                status_code=chat_error.status_code,
+                                code=chat_error.code,
+                                message=(
+                                    "document status is "
+                                    f"{status_text}; ready status is indexed"
+                                ),
+                                correlation_id=chat_error.correlation_id,
+                                details=chat_error.details,
+                            ) from chat_error
                     else:
                         raise
         except ApiError as exc:
@@ -378,6 +395,78 @@ def _handle_chat_prompt() -> None:
         )
 
         _render_assistant_details(st.session_state["messages"][-1])
+
+
+def _request_chat_response(
+    *,
+    api: DocumentInsightApi,
+    prompt: str,
+    document_id: str | None,
+    session_id: str | None,
+    chat_mode: str,
+    placeholder: Any,
+) -> dict[str, Any]:
+    try:
+        return _consume_streamed_response(
+            events=api.ask_stream_events(
+                question=prompt,
+                mode=chat_mode,
+                document_id=document_id,
+                session_id=session_id,
+            ),
+            placeholder=placeholder,
+            mode=chat_mode,
+            document_id=document_id,
+        )
+    except ApiError as stream_error:
+        if stream_error.status_code != 404:
+            raise
+        response = api.ask(
+            question=prompt,
+            mode=chat_mode,
+            document_id=document_id,
+            session_id=session_id,
+        )
+        placeholder.markdown(str(response.get("answer", "")))
+        return response
+
+
+def _is_document_not_ready_error(error: ApiError) -> bool:
+    return error.status_code == 409 and error.code == "document_not_ready"
+
+
+def _wait_for_document_indexed(
+    *,
+    api: DocumentInsightApi,
+    document_id: str,
+    placeholder: Any,
+    timeout_seconds: float = 1800.0,
+    poll_interval_seconds: float = 1.0,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + timeout_seconds
+    latest: dict[str, Any] = {}
+
+    while time.monotonic() < deadline:
+        latest = api.get_ingest_status(document_id=document_id)
+        status = str(latest.get("status") or "unknown")
+        message = str(latest.get("message") or "").strip()
+        _upsert_ingest_history_record(
+            document_id=document_id,
+            status=status,
+            message=message,
+            file_path=str(latest.get("file_path") or "").strip(),
+        )
+        suffix = f": {message}" if message else ""
+        placeholder.markdown(f"_Indexing status: {status}{suffix}_")
+
+        normalized_status = status.lower()
+        if normalized_status == "indexed":
+            return latest
+        if normalized_status in {"failed", "partial"}:
+            return latest
+        time.sleep(poll_interval_seconds)
+
+    return latest
 
 
 def _consume_streamed_response(
@@ -481,6 +570,57 @@ def _normalize_upload_response(response: dict[str, Any]) -> list[dict[str, Any]]
             "file_path": response.get("file_path"),
         }
     ]
+
+
+def _latest_ingest_status_for_document(document_id: str) -> str:
+    normalized = str(document_id or "").strip()
+    history = st.session_state.get("ingest_history") or []
+    if not normalized or not isinstance(history, list):
+        if history:
+            return str(history[-1].get("status") or "n/a")
+        return "n/a"
+
+    for item in reversed(history):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("document_id") or "").strip() == normalized:
+            return str(item.get("status") or "n/a")
+
+    if history:
+        return str(history[-1].get("status") or "n/a")
+    return "n/a"
+
+
+def _upsert_ingest_history_record(
+    *,
+    document_id: str,
+    status: str,
+    message: str,
+    file_path: str,
+) -> None:
+    if not document_id:
+        return
+
+    history = st.session_state.get("ingest_history")
+    if not isinstance(history, list):
+        history = []
+        st.session_state["ingest_history"] = history
+
+    record = {
+        "document_id": document_id,
+        "status": status,
+        "message": message,
+        "file_path": file_path,
+    }
+
+    for index, item in enumerate(history):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("document_id") or "").strip() == document_id:
+            history[index] = record
+            return
+
+    history.append(record)
 
 
 if __name__ == "__main__":

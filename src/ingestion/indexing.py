@@ -338,7 +338,21 @@ class RedisVLIndexBackend:
 
         def _create_index() -> None:
             index = SearchIndex(schema=redis_schema, redis_url=self.redis_url)
-            index.create(overwrite=False)
+            existing_dimension = self._existing_vector_dimension(
+                index_name=schema.index_name,
+                vector_field_name="embedding",
+            )
+            overwrite = existing_dimension is not None and int(
+                existing_dimension
+            ) != int(schema.dimension)
+            if overwrite:
+                logger.warning(
+                    "Recreating Redis index %s due to vector dimension mismatch (existing=%s expected=%s)",
+                    schema.index_name,
+                    existing_dimension,
+                    schema.dimension,
+                )
+            index.create(overwrite=overwrite)
             self._indices[schema.index_name] = index
 
         _retry_redis_operation(
@@ -348,6 +362,50 @@ class RedisVLIndexBackend:
             backoff_factor=self._retry_backoff_factor,
             operation_name=f"ensure_index({schema.index_name})",
         )
+
+    def _existing_vector_dimension(
+        self,
+        *,
+        index_name: str,
+        vector_field_name: str,
+    ) -> int | None:
+        try:
+            from redis import Redis
+        except ModuleNotFoundError:
+            return None
+
+        client = Redis.from_url(self.redis_url, decode_responses=False)
+        close = getattr(client, "close", None)
+        try:
+            info = client.execute_command("FT.INFO", index_name)
+        except Exception:
+            return None
+        finally:
+            if callable(close):
+                close()
+
+        info_map = _redis_info_pairs_to_map(info)
+        attributes = info_map.get("attributes")
+        if not isinstance(attributes, list):
+            return None
+
+        for entry in attributes:
+            if not isinstance(entry, list):
+                continue
+            field_map = _redis_info_pairs_to_map(entry)
+            identifier = _redis_info_text(field_map.get("identifier"))
+            attribute = _redis_info_text(field_map.get("attribute"))
+            if identifier != vector_field_name and attribute != vector_field_name:
+                continue
+
+            raw_dim = field_map.get("dim")
+            if raw_dim is None:
+                return None
+            try:
+                return int(_redis_info_text(raw_dim))
+            except (TypeError, ValueError):
+                return None
+        return None
 
     def upsert(
         self,
@@ -438,6 +496,25 @@ class RedisVLIndexBackend:
                 QueryMatch(record_id=record_id, score=score, payload=payload)
             )
         return matches
+
+
+def _redis_info_pairs_to_map(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, list):
+        return {}
+
+    result: dict[str, Any] = {}
+    idx = 0
+    while idx + 1 < len(raw):
+        key = _redis_info_text(raw[idx])
+        result[key] = raw[idx + 1]
+        idx += 2
+    return result
+
+
+def _redis_info_text(value: Any) -> str:
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="ignore")
+    return str(value)
 
 
 class InMemoryIndexBackend:

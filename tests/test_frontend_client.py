@@ -283,3 +283,65 @@ def test_metrics_fetches_plain_text_payload() -> None:
 
     metrics = client.metrics()
     assert "die_http_requests_total" in metrics
+
+
+def test_ask_stream_events_yields_decoded_events() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/ask/stream"
+        return httpx.Response(
+            200,
+            text='{"type":"status","message":"starting"}\n'
+            '{"type":"final","response":{"answer":"ok"}}\n',
+        )
+
+    client = DocumentInsightApi(
+        base_url="http://testserver",
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler), base_url="http://testserver"
+        ),
+    )
+
+    events = list(
+        client.ask_stream_events(
+            question="What is due?", mode="fast", document_id="doc_1"
+        )
+    )
+
+    assert events[0]["type"] == "status"
+    assert events[1]["type"] == "final"
+    assert events[1]["response"]["answer"] == "ok"
+
+
+def test_ask_stream_events_raises_api_error_for_error_response() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/ask/stream"
+        return httpx.Response(
+            503,
+            json={
+                "code": "deep_mode_disabled",
+                "message": "deep mode is disabled",
+                "correlation_id": "corr-stream-1",
+            },
+        )
+
+    client = DocumentInsightApi(
+        base_url="http://testserver",
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler), base_url="http://testserver"
+        ),
+    )
+
+    with pytest.raises(ApiError) as exc_info:
+        list(
+            client.ask_stream_events(
+                question="What is due?",
+                mode="deep",
+                document_id="doc_1",
+            )
+        )
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.code == "deep_mode_disabled"
+    assert exc_info.value.correlation_id == "corr-stream-1"

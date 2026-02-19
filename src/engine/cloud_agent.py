@@ -95,7 +95,7 @@ class CloudAgentEngine:
 
         self.model_client = model_client
         self.tool_provider = tool_provider or (
-            lambda document_id: get_fs_tools(document_id)
+            lambda document_id: get_fs_tools(document_id, cfg=cfg)
         )
         self.cfg = cfg
         self.max_iterations = max_iterations
@@ -120,7 +120,56 @@ class CloudAgentEngine:
             )
 
         started = time.perf_counter()
-        tools = self.tool_provider(document_id)
+        try:
+            tools = self.tool_provider(document_id)
+        except FileNotFoundError as exc:
+            return self._terminal_response(
+                mode=mode,
+                document_id=document_id,
+                answer=(
+                    "Deep reasoning requires a parsed markdown artifact for this "
+                    "document. Re-ingest the document and try again."
+                ),
+                insufficient_evidence=True,
+                retrieved_keys=[],
+                trace_events=[
+                    TraceEvent(
+                        stage="tool_call",
+                        message="parsed artifact missing",
+                        latency_ms=_latency_ms(started),
+                        metadata={
+                            "code": "parsed_artifact_missing",
+                            "error": str(exc),
+                        },
+                    )
+                ],
+                iterations=0,
+                termination_reason="parsed_artifact_missing",
+                started=started,
+            )
+        except Exception as exc:
+            return self._terminal_response(
+                mode=mode,
+                document_id=document_id,
+                answer=(
+                    "Deep reasoning tools are temporarily unavailable for this "
+                    "document. Try again shortly."
+                ),
+                insufficient_evidence=True,
+                retrieved_keys=[],
+                trace_events=[
+                    TraceEvent(
+                        stage="tool_call",
+                        message="tool provider unavailable",
+                        latency_ms=_latency_ms(started),
+                        metadata={"code": "tooling_unavailable", "error": str(exc)},
+                    )
+                ],
+                iterations=0,
+                termination_reason="tooling_unavailable",
+                started=started,
+            )
+
         history: list[dict[str, Any]] = []
         trace_events: list[TraceEvent] = []
         retrieved_keys: list[str] = []

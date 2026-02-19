@@ -34,20 +34,15 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        INSTALL_DOCLING: ${INSTALL_DOCLING:-false}
+    env_file:
+      - ${DIE_PROFILE_ENV_FILE:-.env.profile.lite}
+      - .env
     environment:
-      REDIS_URL: redis://redis:6379/0
-      OLLAMA_BASE_URL: http://ollama:11434
-      LOCAL_LLM_MODEL: llama3.2:1b
+      REDIS_URL: ${REDIS_URL_DOCKER:-redis://redis:6379/0}
+      OLLAMA_BASE_URL: ${OLLAMA_BASE_URL_DOCKER:-http://ollama:11434}
       DATA_DIR: /app/data
-      REQUEST_TIMEOUT_SECONDS: 120
-      DEEP_MODE_ENABLED: "true"
-      CLOUD_AGENT_PROVIDER: local
-      LOCAL_EMBEDDING_PROVIDER: ollama
-      CLOUD_EMBEDDING_PROVIDER: ollama
-      EMBEDDING_ROLLOUT_MODE: provider
-      DOCLING_ENABLED: "true"
-      GOOGLE_PARSER_ENABLED: "true"
-      LANGEXTRACT_ENABLED: "true"
     ports:
       - "8000:8000"
     volumes:
@@ -69,6 +64,11 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        INSTALL_DOCLING: ${INSTALL_DOCLING:-false}
+    env_file:
+      - ${DIE_PROFILE_ENV_FILE:-.env.profile.lite}
+      - .env
     command:
       [
         "streamlit",
@@ -79,7 +79,7 @@ services:
         "--browser.gatherUsageStats=false",
       ]
     environment:
-      DOCUMENT_INSIGHT_API_BASE_URL: http://api:8000
+      DOCUMENT_INSIGHT_API_BASE_URL: ${DOCUMENT_INSIGHT_API_BASE_URL_DOCKER:-http://api:8000}
     ports:
       - "8501:8501"
     depends_on:

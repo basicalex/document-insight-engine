@@ -198,6 +198,7 @@ class IngestionWorkerPool:
 
     async def _worker_loop(self, *, worker_id: int) -> None:
         while not self._stop_event.is_set():
+            job: IngestionQueueJob | None = None
             try:
                 job = await self.backend.dequeue(self.poll_timeout_seconds)
                 if job is None:
@@ -206,8 +207,15 @@ class IngestionWorkerPool:
                 await self._process_job(job=job, worker_id=worker_id)
             except asyncio.CancelledError:  # pragma: no cover - task cancellation path
                 return
-            except Exception:
+            except Exception as exc:
                 logger.exception("Ingestion worker %s crashed on job loop", worker_id)
+                if job is None:
+                    continue
+                await self._handle_worker_loop_failure(
+                    job=job,
+                    worker_id=worker_id,
+                    error=exc,
+                )
 
     async def _process_job(self, *, job: IngestionQueueJob, worker_id: int) -> None:
         lock_key = f"queue:doc:{job.document_id}"
@@ -232,15 +240,12 @@ class IngestionWorkerPool:
                 message="ingestion is processing",
             )
 
-            record = await asyncio.wait_for(
-                asyncio.to_thread(
-                    self.orchestrator.process,
-                    job.document_id,
-                    Path(job.file_path),
-                    job.mime_type,
-                    job.idempotency_key,
-                ),
-                timeout=self.ingest_timeout_seconds,
+            record = await asyncio.to_thread(
+                self.orchestrator.process,
+                job.document_id,
+                Path(job.file_path),
+                job.mime_type,
+                job.idempotency_key,
             )
             await self._persist_status(
                 document_id=job.document_id,
@@ -313,6 +318,49 @@ class IngestionWorkerPool:
         )
         if self.telemetry is not None:
             self.telemetry.record_ingestion_status(status)
+
+    async def _handle_worker_loop_failure(
+        self,
+        *,
+        job: IngestionQueueJob,
+        worker_id: int,
+        error: Exception,
+    ) -> None:
+        if job.attempt < self.max_retries:
+            next_attempt = job.attempt + 1
+            await self._persist_status(
+                document_id=job.document_id,
+                file_path=job.file_path,
+                status=IngestionStatus.PROCESSING,
+                message=(
+                    f"ingestion retrying (attempt {next_attempt}/{self.max_retries})"
+                ),
+            )
+            await self._requeue(
+                job=replace(job, attempt=next_attempt),
+                delay_seconds=self.retry_backoff_seconds * max(1, next_attempt),
+            )
+            if self.telemetry is not None:
+                self.telemetry.record_ingestion_retry()
+            return
+
+        message = f"ingestion failed after retries: {error}"
+        await self._persist_status(
+            document_id=job.document_id,
+            file_path=job.file_path,
+            status=IngestionStatus.FAILED,
+            message=message,
+        )
+        await self.backend.push_dead_letter(job, error=str(error))
+        self._dead_letter_jobs += 1
+        if self.telemetry is not None:
+            self.telemetry.record_ingestion_dead_letter()
+        logger.warning(
+            "Ingestion worker %s moved document %s to dead letter after worker crash: %s",
+            worker_id,
+            job.document_id,
+            error,
+        )
 
 
 def build_ingestion_queue_backend(
