@@ -578,6 +578,18 @@ async def ingest(
     return ingest_response
 
 
+@app.get("/ingests", response_model=UploadBatchResponse)
+async def list_recent_ingestions(
+    limit: int = 50,
+    services: ApiServices = Depends(get_services),
+) -> UploadBatchResponse:
+    records = await services.state_store.get_recent_ingestions(limit=limit)
+    return UploadBatchResponse(
+        documents=records,
+        count=len(records),
+    )
+
+
 @app.get("/ingest/{document_id}", response_model=IngestResponse)
 async def get_ingest_status(
     document_id: str,

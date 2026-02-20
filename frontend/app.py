@@ -20,16 +20,39 @@ from frontend.state import (
 )
 
 
+def initialize_session_state_with_url_params() -> None:
+    initialize_session_state(st.session_state)
+
+    # Try to load doc from query params
+    if "doc" in st.query_params and not st.session_state.get("active_document_id"):
+        st.session_state["active_document_id"] = st.query_params["doc"]
+
+    if not st.session_state.get("runtime_bootstrapped", False):
+        _refresh_runtime_data(silent=True)
+        # Fetch initial ingest history
+        try:
+            with DocumentInsightApi(base_url=st.session_state["api_base_url"]) as api:
+                recent = api.get_recent_ingestions(limit=20)
+                if isinstance(recent, dict) and "documents" in recent:
+                    for doc in reversed(recent["documents"]):  # Keep chronological
+                        _upsert_ingest_history_record(
+                            document_id=doc.get("document_id", ""),
+                            status=doc.get("status", ""),
+                            message=doc.get("message", ""),
+                            file_path=doc.get("file_path", ""),
+                        )
+        except Exception:
+            pass  # Fail silently on initial load if backend is down
+        st.session_state["runtime_bootstrapped"] = True
+
+
 def main() -> None:
     st.set_page_config(
         page_title="Document Insight Chat",
         page_icon=":page_facing_up:",
         layout="wide",
     )
-    initialize_session_state(st.session_state)
-    if not st.session_state.get("runtime_bootstrapped", False):
-        _refresh_runtime_data(silent=True)
-        st.session_state["runtime_bootstrapped"] = True
+    initialize_session_state_with_url_params()
 
     st.title("Document Insight Engine")
     st.caption("Upload a document, switch answer depth, and inspect grounded traces.")
@@ -89,12 +112,39 @@ def _render_sidebar() -> None:
     )
     st.session_state["api_key"] = str(api_key or "").strip()
 
-    document_id_value = st.sidebar.text_input(
-        "Document ID (optional)",
-        value=st.session_state["active_document_id"],
-        placeholder="doc_123",
+    # Prepare options for the document selectbox
+    # The history contains dicts with 'document_id', 'file_path', 'status', etc.
+    history = st.session_state.get("ingest_history", [])
+    recent_docs = []
+    seen = set()
+    for item in reversed(history):
+        doc_id = item.get("document_id")
+        if doc_id and doc_id not in seen:
+            seen.add(doc_id)
+            recent_docs.append(doc_id)
+
+    # Include the active document if it's not in the history
+    active_doc = st.session_state.get("active_document_id", "")
+    if active_doc and active_doc not in seen:
+        recent_docs.insert(0, active_doc)
+
+    options = [""] + recent_docs
+    index = options.index(active_doc) if active_doc in options else 0
+
+    document_id_value = st.sidebar.selectbox(
+        "Document ID",
+        options=options,
+        index=index,
+        format_func=lambda x: x if x else "None (Select or upload)",
     )
-    set_document_id(st.session_state, str(document_id_value or ""))
+
+    if document_id_value != active_doc:
+        set_document_id(st.session_state, str(document_id_value or ""))
+        if document_id_value:
+            st.query_params["doc"] = str(document_id_value)
+        else:
+            if "doc" in st.query_params:
+                del st.query_params["doc"]
 
     session_id_value = st.sidebar.text_input(
         "Session ID (optional)",
@@ -207,6 +257,7 @@ def _handle_upload(uploaded_files: list[Any]) -> None:
         document_id = str(latest.get("document_id", "")).strip()
         if document_id:
             st.session_state["active_document_id"] = document_id
+            st.query_params["doc"] = document_id
         st.sidebar.success(f"Ingested {len(records)} document(s)")
 
 

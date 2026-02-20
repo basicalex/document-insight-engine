@@ -111,6 +111,18 @@ class DocumentInsightApi:
 
         return _decode_response(response)
 
+    def get_recent_ingestions(self, limit: int = 50) -> dict[str, Any]:
+        try:
+            response = self._client.get("/ingests", params={"limit": limit})
+        except httpx.HTTPError as exc:
+            raise ApiError(
+                status_code=0,
+                code="network_error",
+                message="unable to reach API service",
+                details={"error": str(exc)},
+            ) from exc
+        return _decode_response(response)
+
     def get_ingest_status(self, *, document_id: str) -> dict[str, Any]:
         try:
             response = self._client.get(f"/ingest/{document_id}")

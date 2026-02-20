@@ -31,6 +31,8 @@ class ApiStateStore(Protocol):
 
     async def put_ingestion_record(self, response: IngestResponse) -> None: ...
 
+    async def get_recent_ingestions(self, limit: int = 50) -> list[IngestResponse]: ...
+
     async def get_session_history(self, key: str) -> list[dict[str, str]]: ...
 
     async def append_session_turn(
@@ -83,6 +85,7 @@ class InMemoryApiStateBackend:
     )
     idempotency_claims: dict[str, float] = field(default_factory=dict)
     ingestion_records: dict[str, tuple[str, float | None]] = field(default_factory=dict)
+    recent_ingestions: list[str] = field(default_factory=list)
     session_histories: dict[str, tuple[list[dict[str, str]], float | None]] = field(
         default_factory=dict
     )
@@ -144,10 +147,34 @@ class InMemoryApiStateStore:
     async def put_ingestion_record(self, response: IngestResponse) -> None:
         async with self._lock:
             self._prune_expired()
+            payload = _encode_model_payload(response)
             self.backend.ingestion_records[response.document_id] = (
-                _encode_model_payload(response),
+                payload,
                 self._expires_at(self.ingestion_ttl_seconds),
             )
+
+            # Use timestamp for recent ingestions tracking
+            self.backend.recent_ingestions.append(response.document_id)
+            if response.document_id in self.backend.recent_ingestions[:-1]:
+                self.backend.recent_ingestions.remove(response.document_id)
+            if len(self.backend.recent_ingestions) > 100:
+                self.backend.recent_ingestions.pop(0)
+
+    async def get_recent_ingestions(self, limit: int = 50) -> list[IngestResponse]:
+        async with self._lock:
+            self._prune_expired()
+            results = []
+            count = 0
+            for doc_id in reversed(self.backend.recent_ingestions):
+                if count >= limit:
+                    break
+                stored = self.backend.ingestion_records.get(doc_id)
+                if stored:
+                    parsed = _decode_model_payload(stored[0])
+                    if parsed:
+                        results.append(parsed)
+                        count += 1
+            return results
 
     async def get_session_history(self, key: str) -> list[dict[str, str]]:
         async with self._lock:
@@ -280,10 +307,41 @@ class RedisApiStateStore:
     async def put_ingestion_record(self, response: IngestResponse) -> None:
         key = self._ingestion_record_key(response.document_id)
         payload = _encode_model_payload(response)
+
+        pipeline = self._client.pipeline(transaction=True)
         if self._ingestion_ttl_seconds > 0:
-            await self._client.set(key, payload, ex=self._ingestion_ttl_seconds)
-            return
-        await self._client.set(key, payload)
+            pipeline.set(key, payload, ex=self._ingestion_ttl_seconds)
+        else:
+            pipeline.set(key, payload)
+
+        recent_key = self._recent_ingestions_key()
+        # Add to sorted set with current timestamp as score
+        pipeline.zadd(recent_key, {response.document_id: time.time()})
+        # Keep only the newest limit items (e.g., 100)
+        pipeline.zremrangebyrank(recent_key, 0, -101)
+        if self._ingestion_ttl_seconds > 0:
+            pipeline.expire(recent_key, self._ingestion_ttl_seconds)
+
+        await pipeline.execute()
+
+    async def get_recent_ingestions(self, limit: int = 50) -> list[IngestResponse]:
+        recent_key = self._recent_ingestions_key()
+        # Get newest first
+        doc_ids = await self._client.zrevrange(recent_key, 0, limit - 1)
+        if not doc_ids:
+            return []
+
+        # MGET to fetch all payloads at once
+        keys = [self._ingestion_record_key(doc_id) for doc_id in doc_ids]
+        raw_payloads = await self._client.mget(keys)
+
+        results = []
+        for raw in raw_payloads:
+            if raw:
+                parsed = _decode_model_payload(raw)
+                if parsed:
+                    results.append(parsed)
+        return results
 
     async def get_session_history(self, key: str) -> list[dict[str, str]]:
         rows = await self._client.lrange(self._session_history_key(key), 0, -1)
@@ -327,6 +385,9 @@ class RedisApiStateStore:
 
     def _ingestion_record_key(self, document_id: str) -> str:
         return f"{self._key_prefix}:ingest:{document_id}"
+
+    def _recent_ingestions_key(self) -> str:
+        return f"{self._key_prefix}:ingest:recent"
 
     def _session_history_key(self, key: str) -> str:
         return f"{self._key_prefix}:session:{key}"
