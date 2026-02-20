@@ -92,11 +92,11 @@ class Settings(BaseSettings):
     embedding_filter_strict: bool = True
     embedding_timeout_seconds: PositiveInt = 30
     local_embedding_provider: Literal["hash", "ollama"] = "ollama"
-    local_embedding_model: str = "all-minilm"
-    local_embedding_dimension: PositiveInt = 384
+    local_embedding_model: str = "nomic-embed-text:v1.5"
+    local_embedding_dimension: PositiveInt = 768
     cloud_embedding_provider: Literal["hash", "ollama", "gemini"] = "ollama"
-    cloud_embedding_model: str = "all-minilm"
-    cloud_embedding_dimension: PositiveInt = 384
+    cloud_embedding_model: str = "nomic-embed-text:v1.5"
+    cloud_embedding_dimension: PositiveInt = 768
 
     docling_enabled: bool = True
     google_parser_enabled: bool = True

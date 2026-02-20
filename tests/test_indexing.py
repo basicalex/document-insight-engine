@@ -52,7 +52,7 @@ def test_persist_records_adds_provider_model_and_tags_metadata() -> None:
 
     _, payload = backend.records["tier1_idx"]["r1"]
     assert payload["embedding_provider"] == "local"
-    assert payload["embedding_model"] == "all-minilm"
+    assert payload["embedding_model"] == "nomic-embed-text:v1.5"
     assert payload["tier"] == "tier1"
     assert payload["tags"] == ["invoice", "finance"]
     assert payload["section_path"] == "Invoice/Totals"
