@@ -41,9 +41,10 @@ def test_settings_ensure_runtime_dirs(tmp_path: Path) -> None:
     assert (tmp_path / "traces").exists()
 
 
-def test_settings_rejects_enabled_deep_mode_with_disabled_provider() -> None:
-    with pytest.raises(ValidationError):
-        Settings(deep_mode_enabled=True, cloud_agent_provider="disabled")
+def test_settings_accepts_enabled_deep_mode_with_disabled_provider() -> None:
+    cfg = Settings(deep_mode_enabled=True, cloud_agent_provider="disabled")
+    assert cfg.deep_mode_enabled is True
+    assert cfg.cloud_agent_provider == "disabled"
 
 
 def test_settings_accepts_enabled_deep_mode_with_fallback_provider() -> None:
@@ -55,6 +56,12 @@ def test_settings_accepts_enabled_deep_mode_with_local_provider() -> None:
     cfg = Settings(deep_mode_enabled=True, cloud_agent_provider="local")
     assert cfg.deep_mode_enabled is True
     assert cfg.cloud_agent_provider == "local"
+
+
+def test_settings_supports_local_deep_model_override() -> None:
+    cfg = Settings(local_llm_model="fast-model", local_deep_model="qwen2.5:7b-instruct")
+    assert cfg.local_llm_model == "fast-model"
+    assert cfg.local_deep_model == "qwen2.5:7b-instruct"
 
 
 def test_settings_rejects_gemini_provider_without_api_key(

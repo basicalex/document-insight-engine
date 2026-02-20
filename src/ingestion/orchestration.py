@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha256
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from src.ingestion.chunking import ChunkingResult
 from src.ingestion.extraction import ExtractionResult
@@ -28,11 +28,19 @@ class IngestionEvent:
 
 
 @dataclass
+class IngestionProgress:
+    stage: str | None = None
+    processed_items: int | None = None
+    total_items: int | None = None
+
+
+@dataclass
 class IngestionRecord:
     document_id: str
     idempotency_key: str
     status: IngestionStatus = IngestionStatus.UPLOADED
     current_stage: str | None = None
+    progress: IngestionProgress | None = None
     completed_stages: list[str] = field(default_factory=list)
     stage_attempts: dict[str, int] = field(default_factory=dict)
     events: list[IngestionEvent] = field(default_factory=list)
@@ -60,7 +68,12 @@ class Chunker(Protocol):
 
 
 class Embedder(Protocol):
-    def embed(self, document_id: str, chunks: ChunkingResult) -> EmbeddingBundle: ...
+    def embed(
+        self,
+        document_id: str,
+        chunks: ChunkingResult,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> EmbeddingBundle: ...
 
 
 class PipelineError(Exception):
@@ -145,6 +158,9 @@ class IngestionOrchestrator:
                 lambda: self.embedder.embed(
                     document_id=document_id,
                     chunks=self._must(chunked, "chunk"),
+                    on_progress=lambda p, t: self._update_progress(
+                        record, "embed", p, t
+                    ),
                 ),
             ),
             (
@@ -209,6 +225,16 @@ class IngestionOrchestrator:
 
     def get_record(self, document_id: str) -> IngestionRecord | None:
         return self._records_by_document.get(document_id)
+
+    def _update_progress(
+        self, record: IngestionRecord, stage: str, processed: int, total: int
+    ) -> None:
+        if record.progress is None:
+            record.progress = IngestionProgress(stage=stage)
+        record.progress.stage = stage
+        record.progress.processed_items = processed
+        record.progress.total_items = total
+        # Optionally, we could fire an event here, but this might spam events.
 
     def _execute_stage(
         self, record: IngestionRecord, stage_name: str, operation: callable

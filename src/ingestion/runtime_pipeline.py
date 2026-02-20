@@ -3,7 +3,7 @@ from __future__ import annotations
 import mimetypes
 from hashlib import sha256
 from pathlib import Path
-from typing import Protocol
+from typing import Callable, Protocol
 
 from src.ingestion.chunking import ChunkingResult
 from src.ingestion.embeddings import HashingEmbeddingClient, TextEmbeddingClient
@@ -164,7 +164,21 @@ class ProviderIngestionEmbedder:
         self.tier1_client = tier1_client
         self.tier4_client = tier4_client
 
-    def embed(self, document_id: str, chunks: ChunkingResult) -> EmbeddingBundle:
+    def embed(
+        self,
+        document_id: str,
+        chunks: ChunkingResult,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> EmbeddingBundle:
+        total_items = len(chunks.child_chunks) + len(chunks.parent_chunks)
+        processed_items = 0
+
+        def _update_progress() -> None:
+            nonlocal processed_items
+            processed_items += 1
+            if on_progress:
+                on_progress(processed_items, total_items)
+
         tier1_records: list[IndexRecord] = []
         for chunk in chunks.child_chunks:
             embedding = self.tier1_client.embed_text(chunk.text)
@@ -188,6 +202,7 @@ class ProviderIngestionEmbedder:
                     embedding_model=embedding.model,
                 )
             )
+            _update_progress()
 
         tier4_records: list[IndexRecord] = []
         for chunk in chunks.parent_chunks:
@@ -211,6 +226,7 @@ class ProviderIngestionEmbedder:
                     embedding_model=embedding.model,
                 )
             )
+            _update_progress()
 
         return EmbeddingBundle(tier1_records=tier1_records, tier4_records=tier4_records)
 

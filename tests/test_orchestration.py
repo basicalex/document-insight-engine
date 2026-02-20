@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from src.config.settings import Settings
 from src.ingestion.chunking import ChildChunk, ChunkingResult, ParentChunk
@@ -95,10 +96,18 @@ class StubEmbedder:
         self.calls = 0
         self.fail_at_embed = fail_at_embed
 
-    def embed(self, document_id: str, chunks: ChunkingResult) -> EmbeddingBundle:
+    def embed(
+        self,
+        document_id: str,
+        chunks: ChunkingResult,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> EmbeddingBundle:
         self.calls += 1
         if self.fail_at_embed:
             raise PipelineError("embed_failed", "embedding provider unavailable")
+
+        if on_progress:
+            on_progress(1, 1)
 
         return EmbeddingBundle(
             tier1_records=[

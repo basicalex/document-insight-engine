@@ -216,6 +216,109 @@ class OllamaHTTPClient:
             raise OllamaGenerateError(f"Ollama request failed: {exc}") from exc
 
 
+class GeminiTextGenerationClient:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key.strip()
+        self.model = model.strip()
+
+    def generate(self, *, model: str, prompt: str, timeout_seconds: int) -> str:
+        resolved_model = model.strip() or self.model
+        if not self.api_key:
+            raise OllamaGenerateError("Gemini API key is not configured")
+        if not resolved_model:
+            raise OllamaGenerateError("Gemini model is not configured")
+
+        payload = {
+            "contents": [
+                {
+                    "role": "user",
+                    "parts": [{"text": prompt}],
+                }
+            ],
+            "generation_config": {
+                "temperature": 0.0,
+            },
+        }
+        endpoint = (
+            f"{self.base_url}/v1beta/models/{resolved_model}:generateContent"
+            f"?key={self.api_key}"
+        )
+        body = json.dumps(payload).encode("utf-8")
+        request = urllib_request.Request(
+            endpoint,
+            method="POST",
+            data=body,
+            headers={"Content-Type": "application/json", "Accept": "application/json"},
+        )
+
+        try:
+            with urllib_request.urlopen(request, timeout=timeout_seconds) as response:
+                raw = response.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            raise OllamaGenerateError(
+                f"Gemini request failed with status {exc.code}"
+            ) from exc
+        except urllib_error.URLError as exc:
+            raise OllamaGenerateError(f"Gemini request failed: {exc}") from exc
+
+        try:
+            decoded = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise OllamaGenerateError("Gemini returned invalid JSON") from exc
+
+        text = _extract_gemini_text(decoded)
+        if not text:
+            raise OllamaGenerateError("Gemini returned an empty response")
+        return text
+
+    def generate_stream(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        timeout_seconds: int,
+    ) -> Iterator[str]:
+        token = self.generate(
+            model=model,
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
+        )
+        if token:
+            yield token
+
+
+def _extract_gemini_text(payload: dict[str, Any]) -> str:
+    candidates = payload.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        return ""
+
+    first = candidates[0]
+    if not isinstance(first, dict):
+        return ""
+
+    content = first.get("content")
+    if not isinstance(content, dict):
+        return ""
+
+    parts = content.get("parts")
+    if not isinstance(parts, list):
+        return ""
+
+    fragments = [
+        part.get("text", "")
+        for part in parts
+        if isinstance(part, dict) and isinstance(part.get("text"), str)
+    ]
+    return "".join(fragments).strip()
+
+
 class LocalQAEngine:
     def __init__(
         self,
@@ -223,6 +326,7 @@ class LocalQAEngine:
         cfg: Settings = settings,
         embedder: QueryEmbedder | None = None,
         ollama_client: OllamaClient | None = None,
+        generation_model: str | None = None,
         prompt_version: str = "local-rag-v1",
         retrieval_top_k: int = 5,
         min_token_overlap: int = 1,
@@ -243,6 +347,7 @@ class LocalQAEngine:
         self.query_vector_dimension = query_vector_dimension
         self.embedder = embedder or HashingQueryEmbedder()
         self.ollama_client = ollama_client or OllamaHTTPClient(cfg.ollama_base_url)
+        self.generation_model = generation_model or cfg.local_llm_model
         self._validate_query_configuration()
 
     def _validate_query_configuration(self) -> None:
@@ -295,7 +400,7 @@ class LocalQAEngine:
             min_token_overlap=self.min_token_overlap,
         ):
             trace = AgentTrace(
-                model=self.cfg.local_llm_model,
+                model=self.generation_model,
                 prompt_version=self.prompt_version,
                 retrieved_chunk_ids=retrieved_chunk_ids,
                 tool_calls=trace_events,
@@ -324,7 +429,7 @@ class LocalQAEngine:
         generation_started = time.perf_counter()
         try:
             answer = self.ollama_client.generate(
-                model=self.cfg.local_llm_model,
+                model=self.generation_model,
                 prompt=prompt,
                 timeout_seconds=self.cfg.request_timeout_seconds,
             )
@@ -337,7 +442,7 @@ class LocalQAEngine:
                 )
             )
             trace = AgentTrace(
-                model=self.cfg.local_llm_model,
+                model=self.generation_model,
                 prompt_version=self.prompt_version,
                 retrieved_chunk_ids=retrieved_chunk_ids,
                 tool_calls=trace_events,
@@ -362,7 +467,7 @@ class LocalQAEngine:
                 stage="generation",
                 message="generated local answer",
                 latency_ms=generation_latency_ms,
-                metadata={"model": self.cfg.local_llm_model},
+                metadata={"model": self.generation_model},
             )
         )
 
@@ -377,7 +482,7 @@ class LocalQAEngine:
             )
 
         trace = AgentTrace(
-            model=self.cfg.local_llm_model,
+            model=self.generation_model,
             prompt_version=self.prompt_version,
             retrieved_chunk_ids=retrieved_chunk_ids,
             tool_calls=trace_events,
@@ -446,7 +551,7 @@ class LocalQAEngine:
                 insufficient_evidence=True,
                 citations=citations,
                 trace=AgentTrace(
-                    model=self.cfg.local_llm_model,
+                    model=self.generation_model,
                     prompt_version=self.prompt_version,
                     retrieved_chunk_ids=retrieved_chunk_ids,
                     tool_calls=trace_events,
@@ -478,7 +583,7 @@ class LocalQAEngine:
             if callable(stream_generate):
                 stream_generate_fn = cast(Callable[..., Iterator[str]], stream_generate)
                 for token in stream_generate_fn(
-                    model=self.cfg.local_llm_model,
+                    model=self.generation_model,
                     prompt=prompt,
                     timeout_seconds=self.cfg.request_timeout_seconds,
                 ):
@@ -488,7 +593,7 @@ class LocalQAEngine:
                     yield {"type": "token", "delta": token}
             else:
                 answer = self.ollama_client.generate(
-                    model=self.cfg.local_llm_model,
+                    model=self.generation_model,
                     prompt=prompt,
                     timeout_seconds=self.cfg.request_timeout_seconds,
                 )
@@ -514,7 +619,7 @@ class LocalQAEngine:
                 insufficient_evidence=True,
                 citations=citations,
                 trace=AgentTrace(
-                    model=self.cfg.local_llm_model,
+                    model=self.generation_model,
                     prompt_version=self.prompt_version,
                     retrieved_chunk_ids=retrieved_chunk_ids,
                     tool_calls=trace_events,
@@ -532,7 +637,7 @@ class LocalQAEngine:
                 stage="generation",
                 message="generated local answer",
                 latency_ms=generation_latency_ms,
-                metadata={"model": self.cfg.local_llm_model},
+                metadata={"model": self.generation_model},
             )
         )
 
@@ -553,7 +658,7 @@ class LocalQAEngine:
             insufficient_evidence=insufficient,
             citations=citations,
             trace=AgentTrace(
-                model=self.cfg.local_llm_model,
+                model=self.generation_model,
                 prompt_version=self.prompt_version,
                 retrieved_chunk_ids=retrieved_chunk_ids,
                 tool_calls=trace_events,

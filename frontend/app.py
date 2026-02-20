@@ -60,6 +60,35 @@ def _render_sidebar() -> None:
     )
     set_mode(st.session_state, str(selected_mode))
 
+    model_backend = st.sidebar.radio(
+        "Model backend",
+        options=["auto", "api", "local"],
+        index=["auto", "api", "local"].index(
+            str(st.session_state.get("model_backend", "auto"))
+            if str(st.session_state.get("model_backend", "auto"))
+            in {"auto", "api", "local"}
+            else "auto"
+        ),
+        horizontal=True,
+        help="auto uses API model when key is available, otherwise local model",
+    )
+    st.session_state["model_backend"] = str(model_backend)
+
+    api_model = st.sidebar.text_input(
+        "API model",
+        value=st.session_state["api_model"],
+        placeholder="gemini-3-flash",
+    )
+    st.session_state["api_model"] = str(api_model or "").strip()
+
+    api_key = st.sidebar.text_input(
+        "API key (optional)",
+        value=st.session_state["api_key"],
+        type="password",
+        help="Used only for chat calls in this UI session",
+    )
+    st.session_state["api_key"] = str(api_key or "").strip()
+
     document_id_value = st.sidebar.text_input(
         "Document ID (optional)",
         value=st.session_state["active_document_id"],
@@ -330,6 +359,9 @@ def _handle_chat_prompt() -> None:
                         document_id=active_document_id,
                         session_id=st.session_state["session_id"] or None,
                         chat_mode=st.session_state["chat_mode"],
+                        model_backend=st.session_state.get("model_backend"),
+                        api_key=st.session_state.get("api_key"),
+                        api_model=st.session_state.get("api_model"),
                         placeholder=answer_placeholder,
                     )
                 except ApiError as chat_error:
@@ -350,6 +382,9 @@ def _handle_chat_prompt() -> None:
                                 document_id=active_document_id,
                                 session_id=st.session_state["session_id"] or None,
                                 chat_mode=st.session_state["chat_mode"],
+                                model_backend=st.session_state.get("model_backend"),
+                                api_key=st.session_state.get("api_key"),
+                                api_model=st.session_state.get("api_model"),
                                 placeholder=answer_placeholder,
                             )
                         else:
@@ -404,6 +439,9 @@ def _request_chat_response(
     document_id: str | None,
     session_id: str | None,
     chat_mode: str,
+    model_backend: str | None,
+    api_key: str | None,
+    api_model: str | None,
     placeholder: Any,
 ) -> dict[str, Any]:
     try:
@@ -413,6 +451,9 @@ def _request_chat_response(
                 mode=chat_mode,
                 document_id=document_id,
                 session_id=session_id,
+                model_backend=model_backend,
+                api_key=api_key,
+                api_model=api_model,
             ),
             placeholder=placeholder,
             mode=chat_mode,
@@ -426,6 +467,9 @@ def _request_chat_response(
             mode=chat_mode,
             document_id=document_id,
             session_id=session_id,
+            model_backend=model_backend,
+            api_key=api_key,
+            api_model=api_model,
         )
         placeholder.markdown(str(response.get("answer", "")))
         return response
@@ -450,14 +494,29 @@ def _wait_for_document_indexed(
         latest = api.get_ingest_status(document_id=document_id)
         status = str(latest.get("status") or "unknown")
         message = str(latest.get("message") or "").strip()
+        progress = latest.get("progress")
+
         _upsert_ingest_history_record(
             document_id=document_id,
             status=status,
             message=message,
             file_path=str(latest.get("file_path") or "").strip(),
         )
-        suffix = f": {message}" if message else ""
-        placeholder.markdown(f"_Indexing status: {status}{suffix}_")
+
+        if progress and isinstance(progress, dict):
+            stage = str(progress.get("stage", "unknown"))
+            processed = int(progress.get("processed_items") or 0)
+            total = int(progress.get("total_items") or 0)
+            if total > 0:
+                percent = min(100, int((processed / total) * 100))
+                placeholder.markdown(
+                    f"_Indexing status: {status} ({stage}: {processed}/{total} - {percent}%)_"
+                )
+            else:
+                placeholder.markdown(f"_Indexing status: {status} ({stage})_")
+        else:
+            suffix = f": {message}" if message else ""
+            placeholder.markdown(f"_Indexing status: {status}{suffix}_")
 
         normalized_status = status.lower()
         if normalized_status == "indexed":

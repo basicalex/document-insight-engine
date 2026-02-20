@@ -130,15 +130,23 @@ class DocumentInsightApi:
         mode: str,
         document_id: str | None = None,
         session_id: str | None = None,
+        model_backend: str | None = None,
+        api_key: str | None = None,
+        api_model: str | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {"question": question, "mode": mode}
         if document_id:
             payload["document_id"] = document_id
         if session_id:
             payload["session_id"] = session_id
+        headers = _chat_headers(
+            model_backend=model_backend,
+            api_key=api_key,
+            api_model=api_model,
+        )
 
         try:
-            response = self._client.post("/ask", json=payload)
+            response = self._client.post("/ask", json=payload, headers=headers)
         except httpx.HTTPError as exc:
             raise ApiError(
                 status_code=0,
@@ -156,15 +164,28 @@ class DocumentInsightApi:
         mode: str,
         document_id: str | None = None,
         session_id: str | None = None,
+        model_backend: str | None = None,
+        api_key: str | None = None,
+        api_model: str | None = None,
     ) -> Iterator[dict[str, Any]]:
         payload: dict[str, Any] = {"question": question, "mode": mode}
         if document_id:
             payload["document_id"] = document_id
         if session_id:
             payload["session_id"] = session_id
+        headers = _chat_headers(
+            model_backend=model_backend,
+            api_key=api_key,
+            api_model=api_model,
+        )
 
         try:
-            with self._client.stream("POST", "/ask/stream", json=payload) as response:
+            with self._client.stream(
+                "POST",
+                "/ask/stream",
+                json=payload,
+                headers=headers,
+            ) as response:
                 if response.is_error:
                     raise _build_api_error(
                         response=response, payload=_safe_json(response)
@@ -297,3 +318,25 @@ def _default_http_message(status_code: int) -> str:
         return HTTPStatus(status_code).phrase.lower()
     except ValueError:
         return "request failed"
+
+
+def _chat_headers(
+    *,
+    model_backend: str | None,
+    api_key: str | None,
+    api_model: str | None,
+) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    backend = (model_backend or "").strip().lower()
+    if backend:
+        headers["x-model-backend"] = backend
+
+    normalized_api_key = (api_key or "").strip()
+    if normalized_api_key:
+        headers["x-api-key"] = normalized_api_key
+
+    normalized_api_model = (api_model or "").strip()
+    if normalized_api_model:
+        headers["x-api-model"] = normalized_api_model
+
+    return headers

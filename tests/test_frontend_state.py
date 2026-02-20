@@ -32,6 +32,9 @@ def test_initialize_session_state_sets_expected_defaults() -> None:
     assert state["extract_schema_text"] == DEFAULT_EXTRACTION_SCHEMA
     assert state["extract_prompt"]
     assert state["last_extract_result"] is None
+    assert state["model_backend"] == "auto"
+    assert state["api_model"] == "gemini-3-flash"
+    assert state["api_key"] == ""
 
 
 def test_initialize_session_state_preserves_existing_values() -> None:

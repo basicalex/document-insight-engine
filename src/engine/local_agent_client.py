@@ -30,7 +30,7 @@ class LocalDeepModelClient:
         history: list[dict[str, Any]],
         allowed_tools: list[str],
     ) -> dict[str, Any]:
-        model = self.model_name or self.cfg.local_llm_model
+        model = self.model_name or self.cfg.local_deep_model or self.cfg.local_llm_model
         prompt = _build_local_turn_prompt(
             question=question,
             mode=mode,
@@ -92,20 +92,12 @@ def _parse_local_response(raw: str) -> dict[str, Any]:
     if text.startswith("```"):
         text = _strip_markdown_fence(text)
 
-    try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
+    parsed = _parse_decision_object(text)
+    if parsed is None:
         return {
             "action": "final",
             "answer": text,
-            "insufficient_evidence": False,
-        }
-
-    if not isinstance(parsed, dict):
-        return {
-            "action": "final",
-            "answer": text,
-            "insufficient_evidence": False,
+            "insufficient_evidence": True,
         }
 
     action = str(parsed.get("action", "")).strip().lower()
@@ -129,12 +121,51 @@ def _parse_local_response(raw: str) -> dict[str, Any]:
         }
 
     answer = str(parsed.get("answer", "")).strip()
-    insufficient = bool(parsed.get("insufficient_evidence", not answer))
+    insufficient_raw = parsed.get("insufficient_evidence", not answer)
+    insufficient = (
+        insufficient_raw if isinstance(insufficient_raw, bool) else (not answer)
+    )
     return {
         "action": "final",
         "answer": answer,
         "insufficient_evidence": insufficient,
     }
+
+
+def _parse_decision_object(text: str) -> dict[str, Any] | None:
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = None
+
+    if isinstance(parsed, dict):
+        return parsed
+
+    decoder = json.JSONDecoder()
+    cursor = 0
+    while cursor < len(text):
+        start = text.find("{", cursor)
+        if start < 0:
+            return None
+
+        try:
+            candidate, end = decoder.raw_decode(text, start)
+        except json.JSONDecodeError:
+            cursor = start + 1
+            continue
+
+        cursor = end
+        if isinstance(candidate, dict) and _looks_like_decision(candidate):
+            return candidate
+
+    return None
+
+
+def _looks_like_decision(candidate: dict[str, Any]) -> bool:
+    action = str(candidate.get("action", "")).strip().lower()
+    if action in {"tool_call", "final"}:
+        return True
+    return "answer" in candidate
 
 
 def _strip_markdown_fence(text: str) -> str:

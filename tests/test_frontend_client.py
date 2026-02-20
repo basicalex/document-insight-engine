@@ -85,6 +85,43 @@ def test_ask_sends_payload_and_returns_answer() -> None:
     assert response["trace"]["iterations"] == 1
 
 
+def test_ask_sends_model_routing_headers_when_provided() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == "/ask"
+        assert request.headers["x-model-backend"] == "api"
+        assert request.headers["x-api-key"] == "key-123"
+        assert request.headers["x-api-model"] == "gemini-3-flash"
+        return httpx.Response(
+            200,
+            json={
+                "answer": "ok",
+                "mode": "fast",
+                "document_id": "doc_123",
+                "insufficient_evidence": False,
+                "citations": [],
+            },
+        )
+
+    client = DocumentInsightApi(
+        base_url="http://testserver",
+        client=httpx.Client(
+            transport=httpx.MockTransport(handler), base_url="http://testserver"
+        ),
+    )
+
+    response = client.ask(
+        question="What is the total due?",
+        mode="fast",
+        document_id="doc_123",
+        model_backend="api",
+        api_key="key-123",
+        api_model="gemini-3-flash",
+    )
+
+    assert response["answer"] == "ok"
+
+
 def test_upload_supports_multi_document_batch_response() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.method == "POST"

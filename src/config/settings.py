@@ -78,6 +78,14 @@ class Settings(BaseSettings):
 
     ollama_base_url: str = "http://ollama:11434"
     local_llm_model: str = "hadad/LFM2.5-1.2B:Q8_0"
+    local_deep_model: str | None = Field(
+        default=None,
+        validation_alias=AliasChoices(
+            "local_deep_model",
+            "LOCAL_DEEP_MODEL",
+            "CLOUD_AGENT_LOCAL_MODEL",
+        ),
+    )
     embedding_rollout_mode: Literal[
         "hash", "provider", "provider_with_hash_fallback"
     ] = "provider_with_hash_fallback"
@@ -108,7 +116,7 @@ class Settings(BaseSettings):
     cloud_agent_provider: Literal["disabled", "fallback", "gemini", "local"] = (
         "disabled"
     )
-    cloud_agent_model: str = "gemini-2.5-flash"
+    cloud_agent_model: str = "gemini-3-flash"
     cloud_agent_api_key: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
@@ -163,10 +171,6 @@ class Settings(BaseSettings):
         ):
             raise ValueError(
                 "cloud_agent_retry_initial_backoff_seconds cannot exceed cloud_agent_retry_max_backoff_seconds"
-            )
-        if self.deep_mode_enabled and self.cloud_agent_provider == "disabled":
-            raise ValueError(
-                "cloud_agent_provider cannot be disabled when deep_mode_enabled is true"
             )
         if self.cloud_agent_provider == "gemini" and not (
             self.cloud_agent_api_key and self.cloud_agent_api_key.strip()

@@ -228,6 +228,9 @@ class StubOrchestrator:
         record.updated_at = datetime.now(timezone.utc)
         return record
 
+    def get_record(self, document_id: str) -> IngestionRecord | None:
+        return None
+
 
 class RetryThenSuccessOrchestrator:
     def __init__(self, failures_before_success: int) -> None:
@@ -253,6 +256,9 @@ class RetryThenSuccessOrchestrator:
         record.updated_at = datetime.now(timezone.utc)
         return record
 
+    def get_record(self, document_id: str) -> IngestionRecord | None:
+        return None
+
 
 class AlwaysFailOrchestrator:
     def __init__(self) -> None:
@@ -267,6 +273,9 @@ class AlwaysFailOrchestrator:
     ) -> IngestionRecord:
         self.calls.append((document_id, file_path, mime_type, idempotency_key))
         raise RuntimeError("poison ingestion payload")
+
+    def get_record(self, document_id: str) -> IngestionRecord | None:
+        return None
 
 
 class FlakyClaimStateStore:
@@ -558,6 +567,8 @@ def test_healthz_reports_local_deep_provider_as_ready(tmp_path: Path) -> None:
         data_dir=tmp_path,
         deep_mode_enabled=True,
         cloud_agent_provider="local",
+        cloud_agent_api_key="",
+        local_deep_model="qwen2.5:7b-instruct",
         ingestion_queue_backend="memory",
     )
 
@@ -568,7 +579,228 @@ def test_healthz_reports_local_deep_provider_as_ready(tmp_path: Path) -> None:
     body = response.json()
     assert body["deep_provider"]["provider"] == "local"
     assert body["deep_provider"]["ready"] is True
-    assert body["deep_provider"]["reason"] == "local_provider"
+    assert body["deep_provider"]["reason"] == "local_fallback"
+    assert body["deep_provider"]["model"] == "qwen2.5:7b-instruct"
+
+
+def test_healthz_prefers_gemini_when_api_key_is_configured(tmp_path: Path) -> None:
+    services = _make_services(tmp_path=tmp_path)
+    services.cfg = Settings(
+        data_dir=tmp_path,
+        deep_mode_enabled=True,
+        cloud_agent_provider="local",
+        cloud_agent_api_key="test-key",
+        cloud_agent_model="gemini-3-flash",
+        ingestion_queue_backend="memory",
+    )
+
+    with _client_with_services(services) as client:
+        response = client.get("/healthz")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["deep_provider"]["provider"] == "gemini"
+    assert body["deep_provider"]["ready"] is True
+    assert body["deep_provider"]["reason"] == "api_key_present"
+    assert body["deep_provider"]["model"] == "gemini-3-flash"
+
+
+def test_resolve_chat_model_routing_prefers_api_in_auto_when_key_available() -> None:
+    cfg = Settings(
+        deep_mode_enabled=True,
+        cloud_agent_provider="local",
+        cloud_agent_api_key="env-key",
+    )
+
+    routing = api_main._resolve_chat_model_routing(
+        cfg=cfg,
+        model_backend_header="auto",
+        api_key_header=None,
+        api_model_header="gemini-3-flash",
+    )
+
+    assert routing.use_api_model is True
+    assert routing.api_key == "env-key"
+    assert routing.api_model == "gemini-3-flash"
+
+
+def test_resolve_chat_model_routing_falls_back_to_local_without_key() -> None:
+    cfg = Settings(
+        deep_mode_enabled=True,
+        cloud_agent_provider="local",
+        cloud_agent_api_key="",
+    )
+
+    routing = api_main._resolve_chat_model_routing(
+        cfg=cfg,
+        model_backend_header="auto",
+        api_key_header=None,
+        api_model_header=None,
+    )
+
+    assert routing.use_api_model is False
+    assert routing.backend == "auto"
+
+
+def test_resolve_chat_model_routing_requires_key_for_api_backend() -> None:
+    cfg = Settings(
+        deep_mode_enabled=True,
+        cloud_agent_provider="local",
+        cloud_agent_api_key="",
+    )
+
+    with pytest.raises(api_main.ApiError) as exc:
+        api_main._resolve_chat_model_routing(
+            cfg=cfg,
+            model_backend_header="api",
+            api_key_header=None,
+            api_model_header=None,
+        )
+
+    assert exc.value.code == "missing_api_key"
+
+
+def test_should_auto_fallback_to_local_detects_deep_provider_failure() -> None:
+    routing = api_main._ChatModelRouting(
+        backend="auto",
+        use_api_model=True,
+        api_key="key-1",
+        api_model="gemini-3-flash",
+    )
+    response = ChatResponse(
+        answer="provider failed",
+        mode=Mode.DEEP,
+        document_id="doc-1",
+        insufficient_evidence=True,
+        citations=[],
+        trace=AgentTrace(
+            model="gemini-3-flash",
+            iterations=1,
+            termination_reason="provider_unavailable",
+        ),
+    )
+
+    should_fallback = api_main._should_auto_fallback_to_local(
+        routing=routing,
+        response=response,
+        mode=Mode.DEEP,
+    )
+
+    assert should_fallback is True
+
+
+def test_should_auto_fallback_to_local_ignores_non_auto_backend() -> None:
+    routing = api_main._ChatModelRouting(
+        backend="api",
+        use_api_model=True,
+        api_key="key-1",
+        api_model="gemini-3-flash",
+    )
+    response = ChatResponse(
+        answer="provider failed",
+        mode=Mode.DEEP,
+        document_id="doc-1",
+        insufficient_evidence=True,
+        citations=[],
+        trace=AgentTrace(
+            model="gemini-3-flash",
+            iterations=1,
+            termination_reason="provider_unavailable",
+        ),
+    )
+
+    should_fallback = api_main._should_auto_fallback_to_local(
+        routing=routing,
+        response=response,
+        mode=Mode.DEEP,
+    )
+
+    assert should_fallback is False
+
+
+def test_ask_deep_auto_falls_back_to_local_on_provider_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    services = _make_services(tmp_path=tmp_path)
+    services.cfg = Settings(
+        data_dir=tmp_path,
+        deep_mode_enabled=True,
+        cloud_agent_provider="local",
+        cloud_agent_api_key="api-key",
+        ingestion_queue_backend="memory",
+    )
+    failing_engine = FailingCloudAgentEngine("provider_unavailable")
+    fallback_engine = StubCloudAgentEngine()
+    calls: list[tuple[str, bool]] = []
+
+    def fake_resolve_deep_engine(*, services: Any, routing: Any) -> Any:
+        del services
+        calls.append((routing.backend, routing.use_api_model))
+        return failing_engine if routing.use_api_model else fallback_engine
+
+    monkeypatch.setattr(
+        api_main,
+        "_resolve_deep_engine_for_request",
+        fake_resolve_deep_engine,
+    )
+
+    with _client_with_services(services) as client:
+        response = client.post(
+            "/ask",
+            json={
+                "question": "Give me a deep answer",
+                "mode": "deep",
+                "document_id": "doc-1",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["answer"] == "cloud-answer"
+    assert calls == [("auto", True), ("local", False)]
+
+
+def test_ask_stream_deep_auto_falls_back_to_local_on_provider_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    services = _make_services(tmp_path=tmp_path)
+    services.cfg = Settings(
+        data_dir=tmp_path,
+        deep_mode_enabled=True,
+        cloud_agent_provider="local",
+        cloud_agent_api_key="api-key",
+        ingestion_queue_backend="memory",
+    )
+    failing_engine = FailingCloudAgentEngine("provider_unavailable")
+    fallback_engine = StubCloudAgentEngine()
+
+    def fake_resolve_deep_engine(*, services: Any, routing: Any) -> Any:
+        del services
+        return failing_engine if routing.use_api_model else fallback_engine
+
+    monkeypatch.setattr(
+        api_main,
+        "_resolve_deep_engine_for_request",
+        fake_resolve_deep_engine,
+    )
+
+    with _client_with_services(services) as client:
+        response = client.post(
+            "/ask/stream",
+            json={
+                "question": "Give me a deep answer",
+                "mode": "deep",
+                "document_id": "doc-1",
+            },
+        )
+
+    assert response.status_code == 200
+    lines = [line for line in response.text.splitlines() if line.strip()]
+    final_event = json.loads(lines[-1])
+    assert final_event["type"] == "final"
+    assert final_event["response"]["answer"] == "cloud-answer"
 
 
 def test_healthz_reports_optional_capability_diagnostics(
@@ -1678,6 +1910,36 @@ def test_ask_validation_error_is_normalized(tmp_path: Path) -> None:
     body = response.json()
     assert body["code"] == "validation_error"
     assert "errors" in body["details"]
+
+
+def test_ask_rejects_invalid_model_backend_header(tmp_path: Path) -> None:
+    services = _make_services(tmp_path=tmp_path)
+
+    with _client_with_services(services) as client:
+        response = client.post(
+            "/ask",
+            json={"question": "What is due?", "mode": "fast", "document_id": "doc-1"},
+            headers={"x-model-backend": "unknown"},
+        )
+
+    assert response.status_code == 422
+    body = response.json()
+    assert body["code"] == "invalid_model_backend"
+
+
+def test_ask_requires_api_key_when_api_backend_requested(tmp_path: Path) -> None:
+    services = _make_services(tmp_path=tmp_path)
+
+    with _client_with_services(services) as client:
+        response = client.post(
+            "/ask",
+            json={"question": "What is due?", "mode": "fast", "document_id": "doc-1"},
+            headers={"x-model-backend": "api"},
+        )
+
+    assert response.status_code == 400
+    body = response.json()
+    assert body["code"] == "missing_api_key"
 
 
 def test_ask_timeout_returns_gateway_timeout(tmp_path: Path) -> None:

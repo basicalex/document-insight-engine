@@ -240,19 +240,39 @@ class IngestionWorkerPool:
                 message="ingestion is processing",
             )
 
-            record = await asyncio.to_thread(
+            loop = asyncio.get_running_loop()
+            process_task = loop.run_in_executor(
+                None,
                 self.orchestrator.process,
                 job.document_id,
                 Path(job.file_path),
                 job.mime_type,
                 job.idempotency_key,
             )
+
+            while not process_task.done():
+                try:
+                    await asyncio.wait_for(asyncio.shield(process_task), timeout=0.5)
+                except asyncio.TimeoutError:
+                    current_record = self.orchestrator.get_record(job.document_id)
+                    if current_record and current_record.progress:
+                        await self._persist_status(
+                            document_id=job.document_id,
+                            file_path=job.file_path,
+                            status=current_record.status,
+                            message=f"ingestion is processing ({current_record.progress.stage})",
+                            progress=current_record.progress,
+                        )
+
+            record = process_task.result()
             await self._persist_status(
                 document_id=job.document_id,
                 file_path=job.file_path,
                 status=record.status,
                 message=_ingestion_status_message(record.status, record.error_message),
+                progress=record.progress,
             )
+
         except Exception as exc:
             if job.attempt < self.max_retries:
                 next_attempt = job.attempt + 1
@@ -307,15 +327,24 @@ class IngestionWorkerPool:
         file_path: str,
         status: IngestionStatus,
         message: str,
+        progress: Any = None,
     ) -> None:
-        await self.state_store.put_ingestion_record(
-            IngestResponse(
-                document_id=document_id,
-                file_path=file_path,
-                status=status,
-                message=message,
+        kwargs = {
+            "document_id": document_id,
+            "file_path": file_path,
+            "status": status,
+            "message": message,
+        }
+        if progress is not None:
+            from src.models.schemas import IngestionProgress as SchemaProgress
+
+            kwargs["progress"] = SchemaProgress(
+                stage=progress.stage,
+                processed_items=progress.processed_items,
+                total_items=progress.total_items,
             )
-        )
+
+        await self.state_store.put_ingestion_record(IngestResponse(**kwargs))
         if self.telemetry is not None:
             self.telemetry.record_ingestion_status(status)
 

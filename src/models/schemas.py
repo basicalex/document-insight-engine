@@ -80,11 +80,18 @@ class ChatResponse(BaseModel):
     trace: AgentTrace | None = None
 
 
+class IngestionProgress(BaseModel):
+    stage: str | None = None
+    processed_items: int | None = None
+    total_items: int | None = None
+
+
 class IngestResponse(BaseModel):
     document_id: str = Field(min_length=1)
     file_path: str = Field(min_length=1)
     status: IngestionStatus = IngestionStatus.UPLOADED
     message: str | None = None
+    progress: IngestionProgress | None = None
 
 
 class UploadBatchResponse(BaseModel):

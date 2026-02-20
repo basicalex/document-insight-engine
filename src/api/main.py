@@ -37,7 +37,11 @@ from src.engine.cloud_agent import (
 from src.engine.extractor import Tier4StructuredExtractor
 from src.engine.gemini_client import GeminiCloudModelClient
 from src.engine.local_agent_client import LocalDeepModelClient
-from src.engine.local_llm import LocalQAEngine, ProviderQueryEmbedder
+from src.engine.local_llm import (
+    GeminiTextGenerationClient,
+    LocalQAEngine,
+    ProviderQueryEmbedder,
+)
 from src.ingestion.embeddings import (
     build_ingestion_embedding_clients,
     build_query_embedding_clients,
@@ -138,6 +142,24 @@ class ApiServices:
     orchestrator: IngestionOrchestrator | None = None
     ingestion_worker_pool: IngestionWorkerPool | None = None
     telemetry: ObservabilityRegistry = field(default_factory=ObservabilityRegistry)
+
+
+@dataclass(frozen=True)
+class _ChatModelRouting:
+    backend: str
+    use_api_model: bool
+    api_key: str | None
+    api_model: str
+
+
+_DEEP_PROVIDER_FAILURE_CODES = {
+    DeepProviderErrorCode.NOT_CONFIGURED.value,
+    DeepProviderErrorCode.AUTHENTICATION_FAILED.value,
+    DeepProviderErrorCode.RATE_LIMITED.value,
+    DeepProviderErrorCode.TIMEOUT.value,
+    DeepProviderErrorCode.UNAVAILABLE.value,
+    DeepProviderErrorCode.MALFORMED_RESPONSE.value,
+}
 
 
 app = FastAPI(title=settings.project_name)
@@ -903,6 +925,9 @@ async def ask(
     payload: ChatRequest,
     request: Request,
     response: Response,
+    model_backend: str | None = Header(default=None, alias="x-model-backend"),
+    api_key: str | None = Header(default=None, alias="x-api-key"),
+    api_model: str | None = Header(default=None, alias="x-api-model"),
     services: ApiServices = Depends(get_services),
 ) -> ChatResponse:
     try:
@@ -913,6 +938,12 @@ async def ask(
             services=services,
             session_id=payload.session_id,
             document_id=payload.document_id,
+        )
+        routing = _resolve_chat_model_routing(
+            cfg=services.cfg,
+            model_backend_header=model_backend,
+            api_key_header=api_key,
+            api_model_header=api_model,
         )
 
         chat_response: ChatResponse
@@ -925,18 +956,49 @@ async def ask(
                     status_code=503,
                     details={"cloud_agent_provider": services.cfg.cloud_agent_provider},
                 )
+            deep_engine = _resolve_deep_engine_for_request(
+                services=services,
+                routing=routing,
+            )
             chat_response = await _ask_with_timeout(
-                handler=lambda: services.cloud_agent.ask(
+                handler=lambda: deep_engine.ask(
                     question=payload.question,
                     mode=payload.mode,
                     document_id=payload.document_id,
                 ),
                 timeout_seconds=services.cfg.request_timeout_seconds,
             )
+
+            if _should_auto_fallback_to_local(
+                routing=routing,
+                response=chat_response,
+                mode=Mode.DEEP,
+            ):
+                logger.warning(
+                    "Deep API model failed (%s); retrying with local backend",
+                    _termination_reason(chat_response),
+                )
+                fallback_engine = _resolve_deep_engine_for_request(
+                    services=services,
+                    routing=_local_chat_routing(services.cfg),
+                )
+                chat_response = await _ask_with_timeout(
+                    handler=lambda: fallback_engine.ask(
+                        question=payload.question,
+                        mode=payload.mode,
+                        document_id=payload.document_id,
+                    ),
+                    timeout_seconds=services.cfg.request_timeout_seconds,
+                )
+
             _raise_if_deep_provider_failed(chat_response)
         else:
+            fast_engine = _resolve_fast_engine_for_request(
+                services=services,
+                routing=routing,
+            )
             chat_response = await _ask_with_timeout(
-                handler=lambda: services.local_qa.ask(
+                handler=lambda: fast_engine.ask(
                     question=payload.question,
                     mode=payload.mode,
                     document_id=payload.document_id,
@@ -944,6 +1006,29 @@ async def ask(
                 ),
                 timeout_seconds=services.cfg.request_timeout_seconds,
             )
+
+            if _should_auto_fallback_to_local(
+                routing=routing,
+                response=chat_response,
+                mode=Mode.FAST,
+            ):
+                logger.warning(
+                    "Fast API model failed (%s); retrying with local backend",
+                    _termination_reason(chat_response),
+                )
+                fallback_engine = _resolve_fast_engine_for_request(
+                    services=services,
+                    routing=_local_chat_routing(services.cfg),
+                )
+                chat_response = await _ask_with_timeout(
+                    handler=lambda: fallback_engine.ask(
+                        question=payload.question,
+                        mode=payload.mode,
+                        document_id=payload.document_id,
+                        chat_history=chat_history,
+                    ),
+                    timeout_seconds=services.cfg.request_timeout_seconds,
+                )
 
         await _record_session_turn(
             services=services,
@@ -982,6 +1067,9 @@ async def ask(
 async def ask_stream(
     payload: ChatRequest,
     request: Request,
+    model_backend: str | None = Header(default=None, alias="x-model-backend"),
+    api_key: str | None = Header(default=None, alias="x-api-key"),
+    api_model: str | None = Header(default=None, alias="x-api-model"),
     services: ApiServices = Depends(get_services),
 ) -> StreamingResponse:
     try:
@@ -993,6 +1081,12 @@ async def ask_stream(
             session_id=payload.session_id,
             document_id=payload.document_id,
         )
+        routing = _resolve_chat_model_routing(
+            cfg=services.cfg,
+            model_backend_header=model_backend,
+            api_key_header=api_key,
+            api_model_header=api_model,
+        )
 
         if payload.mode == Mode.DEEP:
             if not services.cfg.deep_mode_enabled:
@@ -1002,23 +1096,88 @@ async def ask_stream(
                     status_code=503,
                     details={"cloud_agent_provider": services.cfg.cloud_agent_provider},
                 )
+            deep_engine = _resolve_deep_engine_for_request(
+                services=services,
+                routing=routing,
+            )
             response = await _ask_with_timeout(
-                handler=lambda: services.cloud_agent.ask(
+                handler=lambda: deep_engine.ask(
                     question=payload.question,
                     mode=payload.mode,
                     document_id=payload.document_id,
                 ),
                 timeout_seconds=services.cfg.request_timeout_seconds,
             )
+
+            if _should_auto_fallback_to_local(
+                routing=routing,
+                response=response,
+                mode=Mode.DEEP,
+            ):
+                logger.warning(
+                    "Deep API model failed (%s); retrying stream response with local backend",
+                    _termination_reason(response),
+                )
+                fallback_engine = _resolve_deep_engine_for_request(
+                    services=services,
+                    routing=_local_chat_routing(services.cfg),
+                )
+                response = await _ask_with_timeout(
+                    handler=lambda: fallback_engine.ask(
+                        question=payload.question,
+                        mode=payload.mode,
+                        document_id=payload.document_id,
+                    ),
+                    timeout_seconds=services.cfg.request_timeout_seconds,
+                )
+
             _raise_if_deep_provider_failed(response)
             events = _single_response_events(response)
         else:
-            events = services.local_qa.ask_stream_events(
-                question=payload.question,
-                mode=payload.mode,
-                document_id=payload.document_id,
-                chat_history=chat_history,
+            fast_engine = _resolve_fast_engine_for_request(
+                services=services,
+                routing=routing,
             )
+            if routing.backend == "auto" and routing.use_api_model:
+                response = await _ask_with_timeout(
+                    handler=lambda: fast_engine.ask(
+                        question=payload.question,
+                        mode=payload.mode,
+                        document_id=payload.document_id,
+                        chat_history=chat_history,
+                    ),
+                    timeout_seconds=services.cfg.request_timeout_seconds,
+                )
+                if _should_auto_fallback_to_local(
+                    routing=routing,
+                    response=response,
+                    mode=Mode.FAST,
+                ):
+                    logger.warning(
+                        "Fast API model failed (%s); retrying stream response with local backend",
+                        _termination_reason(response),
+                    )
+                    fallback_engine = _resolve_fast_engine_for_request(
+                        services=services,
+                        routing=_local_chat_routing(services.cfg),
+                    )
+                    response = await _ask_with_timeout(
+                        handler=lambda: fallback_engine.ask(
+                            question=payload.question,
+                            mode=payload.mode,
+                            document_id=payload.document_id,
+                            chat_history=chat_history,
+                        ),
+                        timeout_seconds=services.cfg.request_timeout_seconds,
+                    )
+                events = _single_response_events(response)
+            else:
+                events = fast_engine.ask_stream_events(
+                    question=payload.question,
+                    mode=payload.mode,
+                    document_id=payload.document_id,
+                    chat_history=chat_history,
+                )
 
         async def stream_body() -> AsyncIterator[bytes]:
             streamed_tokens: list[str] = []
@@ -1641,38 +1800,197 @@ def _optional_capability_issues(
 
 
 def _deep_provider_diagnostics(cfg: Settings) -> dict[str, Any]:
-    provider = cfg.cloud_agent_provider
-    if provider == "disabled":
+    if not cfg.deep_mode_enabled:
         return {
-            "provider": provider,
+            "provider": "disabled",
             "ready": False,
             "reason": "provider_disabled",
         }
-    if provider == "fallback":
-        return {
-            "provider": provider,
-            "ready": False,
-            "reason": "fallback_provider",
-        }
-    if provider == "local":
-        return {
-            "provider": provider,
-            "ready": True,
-            "reason": "local_provider",
-            "model": cfg.local_llm_model,
-            "base_url": cfg.ollama_base_url,
-            "timeout_seconds": cfg.cloud_agent_timeout_seconds,
-        }
 
     api_key_present = bool((cfg.cloud_agent_api_key or "").strip())
+    if api_key_present:
+        return {
+            "provider": "gemini",
+            "ready": True,
+            "reason": "api_key_present",
+            "model": cfg.cloud_agent_model,
+            "timeout_seconds": cfg.cloud_agent_timeout_seconds,
+            "retry_attempts": cfg.cloud_agent_retry_attempts,
+        }
+
     return {
-        "provider": provider,
-        "ready": api_key_present,
-        "reason": "ready" if api_key_present else "missing_api_key",
-        "model": cfg.cloud_agent_model,
+        "provider": "local",
+        "ready": True,
+        "reason": "local_fallback",
+        "model": cfg.local_deep_model or cfg.local_llm_model,
+        "base_url": cfg.ollama_base_url,
         "timeout_seconds": cfg.cloud_agent_timeout_seconds,
-        "retry_attempts": cfg.cloud_agent_retry_attempts,
     }
+
+
+def _normalized_header_value(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = value.strip()
+    return normalized or None
+
+
+def _resolve_chat_model_routing(
+    *,
+    cfg: Settings,
+    model_backend_header: str | None,
+    api_key_header: str | None,
+    api_model_header: str | None,
+) -> _ChatModelRouting:
+    backend = (_normalized_header_value(model_backend_header) or "auto").lower()
+    if backend not in {"auto", "api", "local"}:
+        raise ApiError(
+            code="invalid_model_backend",
+            message="x-model-backend must be one of: auto, api, local",
+            status_code=422,
+            details={"x-model-backend": backend},
+        )
+
+    api_key = _normalized_header_value(api_key_header) or _normalized_header_value(
+        cfg.cloud_agent_api_key
+    )
+    api_model = _normalized_header_value(api_model_header) or cfg.cloud_agent_model
+
+    if backend == "api" and not api_key:
+        raise ApiError(
+            code="missing_api_key",
+            message="x-api-key or CLOUD_AGENT_API_KEY is required for api backend",
+            status_code=400,
+        )
+
+    use_api_model = backend == "api" or (backend == "auto" and bool(api_key))
+    return _ChatModelRouting(
+        backend=backend,
+        use_api_model=use_api_model,
+        api_key=api_key,
+        api_model=api_model,
+    )
+
+
+def _cfg_with_api_overrides(
+    *,
+    cfg: Settings,
+    api_key: str,
+    api_model: str,
+) -> Settings:
+    return cfg.model_copy(
+        update={
+            "cloud_agent_api_key": api_key,
+            "cloud_agent_model": api_model,
+        }
+    )
+
+
+def _local_chat_routing(cfg: Settings) -> _ChatModelRouting:
+    return _ChatModelRouting(
+        backend="local",
+        use_api_model=False,
+        api_key=None,
+        api_model=cfg.local_deep_model or cfg.local_llm_model,
+    )
+
+
+def _termination_reason(response: ChatResponse) -> str:
+    if response.trace is None:
+        return ""
+    return str(response.trace.termination_reason or "").strip()
+
+
+def _should_auto_fallback_to_local(
+    *,
+    routing: _ChatModelRouting,
+    response: ChatResponse,
+    mode: Mode,
+) -> bool:
+    if routing.backend != "auto" or not routing.use_api_model:
+        return False
+
+    reason = _termination_reason(response)
+    if not reason:
+        return False
+
+    if mode == Mode.DEEP:
+        return reason in _DEEP_PROVIDER_FAILURE_CODES
+    return reason == "generation_error"
+
+
+def _resolve_fast_engine_for_request(
+    *,
+    services: ApiServices,
+    routing: _ChatModelRouting,
+) -> Any:
+    if not routing.use_api_model:
+        return services.local_qa
+    if not isinstance(services.local_qa, LocalQAEngine):
+        return services.local_qa
+    if not routing.api_key:
+        return services.local_qa
+
+    base_engine = services.local_qa
+    cfg_override = _cfg_with_api_overrides(
+        cfg=services.cfg,
+        api_key=routing.api_key,
+        api_model=routing.api_model,
+    )
+    generation_client = GeminiTextGenerationClient(
+        base_url=cfg_override.cloud_agent_api_base_url,
+        api_key=routing.api_key,
+        model=routing.api_model,
+    )
+    return LocalQAEngine(
+        index_store=base_engine.index_store,
+        cfg=cfg_override,
+        embedder=base_engine.embedder,
+        ollama_client=generation_client,
+        generation_model=routing.api_model,
+        prompt_version=base_engine.prompt_version,
+        retrieval_top_k=base_engine.retrieval_top_k,
+        min_token_overlap=base_engine.min_token_overlap,
+        query_vector_dimension=base_engine.query_vector_dimension,
+    )
+
+
+def _resolve_deep_engine_for_request(
+    *,
+    services: ApiServices,
+    routing: _ChatModelRouting,
+) -> Any:
+    if not isinstance(services.cloud_agent, CloudAgentEngine):
+        return services.cloud_agent
+
+    tool_provider = services.cloud_agent.tool_provider
+    max_iterations = services.cloud_agent.max_iterations
+    prompt_version = services.cloud_agent.prompt_version
+
+    if routing.use_api_model and routing.api_key:
+        cfg_override = _cfg_with_api_overrides(
+            cfg=services.cfg,
+            api_key=routing.api_key,
+            api_model=routing.api_model,
+        )
+        return CloudAgentEngine(
+            model_client=GeminiCloudModelClient(cfg=cfg_override),
+            tool_provider=tool_provider,
+            cfg=cfg_override,
+            max_iterations=max_iterations,
+            model_name=routing.api_model,
+            prompt_version=prompt_version,
+        )
+
+    local_model = services.cfg.local_deep_model or services.cfg.local_llm_model
+    return CloudAgentEngine(
+        model_client=LocalDeepModelClient(cfg=services.cfg, model_name=local_model),
+        tool_provider=tool_provider,
+        cfg=services.cfg,
+        max_iterations=max_iterations,
+        model_name=local_model,
+        prompt_version=prompt_version,
+    )
 
 
 async def _read_session_history(
