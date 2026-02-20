@@ -1963,6 +1963,14 @@ def _resolve_deep_engine_for_request(
     if not isinstance(services.cloud_agent, CloudAgentEngine):
         return services.cloud_agent
 
+    # Preserve test mocks by checking if the base client is one of our standard providers
+    base_client = services.cloud_agent.model_client
+    is_standard_client = isinstance(
+        base_client, (GeminiCloudModelClient, LocalDeepModelClient)
+    )
+    if not is_standard_client:
+        return services.cloud_agent
+
     tool_provider = services.cloud_agent.tool_provider
     max_iterations = services.cloud_agent.max_iterations
     prompt_version = services.cloud_agent.prompt_version
