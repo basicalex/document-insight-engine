@@ -32,7 +32,6 @@ from src.ingestion.parsing import (
 )
 from src.ingestion.google_parser import GoogleParserError, Tier2GoogleParser
 from src.ingestion.orchestration import (
-    EmbeddingBundle,
     IngestionEvent,
     IngestionOrchestrator,
     IngestionRecord,

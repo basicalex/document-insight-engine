@@ -133,7 +133,7 @@ class IngestionOrchestrator:
 
         self._transition(record=record, next_status=IngestionStatus.PROCESSING)
 
-        extraction: ExtractionResult | None = None
+        # extraction: ExtractionResult | None = None
         parsed: ParsedMarkdownDocument | None = None
         chunked: ChunkingResult | None = None
         embeddings: EmbeddingBundle | None = None
@@ -195,7 +195,7 @@ class IngestionOrchestrator:
                 return record
 
             if stage_name == "extract":
-                extraction = output
+                pass  # previously extraction = output
             elif stage_name == "parse":
                 parsed = output
                 parser_name = str(getattr(output, "parser_name", "unknown"))
