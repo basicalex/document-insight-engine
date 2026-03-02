@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from dataclasses import dataclass
 from enum import Enum
@@ -10,7 +11,12 @@ from src.models.schemas import AgentTrace, ChatResponse, Mode, TraceEvent
 from src.tools import get_fs_tools
 
 
-ALLOWED_TOOL_NAMES = ("list_sections", "read_section", "keyword_grep")
+ALLOWED_TOOL_NAMES = (
+    "list_sections",
+    "read_section",
+    "keyword_grep",
+    "structured_extract",
+)
 
 
 class DeepProviderAction(str, Enum):
@@ -87,7 +93,7 @@ class CloudAgentEngine:
         tool_provider: ToolProvider | None = None,
         cfg: Settings = settings,
         max_iterations: int = 5,
-        model_name: str = "gemini-3-flash",
+        model_name: str = "gemini-2.5-flash",
         prompt_version: str = "cloud-agent-v1",
     ) -> None:
         if max_iterations <= 0:
@@ -102,33 +108,26 @@ class CloudAgentEngine:
         self.model_name = model_name
         self.prompt_version = prompt_version
 
-    def ask(self, question: str, mode: Mode, document_id: str | None) -> ChatResponse:
-        if not document_id:
-            trace = AgentTrace(
-                model=self.model_name,
-                prompt_version=self.prompt_version,
-                iterations=0,
-                termination_reason="missing_document_id",
-            )
-            return ChatResponse(
-                answer="Deep mode requires a document_id for filesystem reasoning.",
-                mode=mode,
-                document_id=document_id,
-                insufficient_evidence=True,
-                citations=[],
-                trace=trace,
-            )
+    def ask(
+        self,
+        question: str,
+        mode: Mode,
+        document_id: str | None,
+        chat_history: list[dict[str, str]] | None = None,
+    ) -> ChatResponse:
+        normalized_document_id = (document_id or "").strip()
+        tool_scope_document_id = normalized_document_id or "__all_documents__"
 
         started = time.perf_counter()
         try:
-            tools = self.tool_provider(document_id)
+            tools = self.tool_provider(tool_scope_document_id)
         except FileNotFoundError as exc:
             return self._terminal_response(
                 mode=mode,
                 document_id=document_id,
                 answer=(
-                    "Deep reasoning requires a parsed markdown artifact for this "
-                    "document. Re-ingest the document and try again."
+                    "Deep reasoning requires parsed markdown artifacts for the selected "
+                    "scope. Re-ingest documents and try again."
                 ),
                 insufficient_evidence=True,
                 retrieved_keys=[],
@@ -170,7 +169,10 @@ class CloudAgentEngine:
                 started=started,
             )
 
-        history: list[dict[str, Any]] = []
+        history: list[dict[str, Any]] = _seed_history_from_chat(
+            chat_history,
+            max_turns=int(self.cfg.api_state_session_max_turns),
+        )
         trace_events: list[TraceEvent] = []
         retrieved_keys: list[str] = []
 
@@ -180,7 +182,7 @@ class CloudAgentEngine:
                 raw_decision = self.model_client.next_step(
                     question=question,
                     mode=mode,
-                    document_id=document_id,
+                    document_id=tool_scope_document_id,
                     iteration=iteration,
                     history=history,
                     allowed_tools=list(ALLOWED_TOOL_NAMES),
@@ -314,7 +316,34 @@ class CloudAgentEngine:
                 )
 
             call_started = time.perf_counter()
-            result = tool(**validated)
+            try:
+                result = tool(**validated)
+            except Exception as exc:
+                trace_events.append(
+                    TraceEvent(
+                        stage="tool_call",
+                        message="tool execution failed",
+                        latency_ms=_latency_ms(call_started),
+                        metadata={
+                            "iteration": str(iteration),
+                            "tool_name": tool_name,
+                            "code": "tool_execution_failed",
+                            "error": str(exc),
+                        },
+                    )
+                )
+                return self._terminal_response(
+                    mode=mode,
+                    document_id=document_id,
+                    answer="Deep reasoning could not execute one of its tools.",
+                    insufficient_evidence=True,
+                    retrieved_keys=retrieved_keys,
+                    trace_events=trace_events,
+                    iterations=iteration,
+                    termination_reason="tool_execution_failed",
+                    started=started,
+                )
+
             call_latency = _latency_ms(call_started)
 
             if isinstance(result, dict) and result.get("ok") is False:
@@ -345,7 +374,10 @@ class CloudAgentEngine:
                     "role": "tool",
                     "tool_name": tool_name,
                     "arguments": validated,
-                    "result": result,
+                    "result": _compact_tool_result_for_history(
+                        tool_name=tool_name,
+                        result=result,
+                    ),
                 }
             )
 
@@ -536,6 +568,50 @@ def _validate_tool_invocation(
             normalized["max_chars"] = arguments["max_chars"]
         return normalized
 
+    if tool_name == "structured_extract":
+        allowed = {"schema", "prompt", "section_key", "max_chars"}
+        if set(arguments.keys()) - allowed:
+            return _ToolValidationError(
+                code="invalid_tool_request",
+                message="structured_extract received unsupported arguments",
+            )
+
+        schema = arguments.get("schema")
+        if not isinstance(schema, dict) or not schema:
+            return _ToolValidationError(
+                code="invalid_tool_request",
+                message="structured_extract.schema must be a non-empty object",
+            )
+
+        normalized = {"schema": schema}
+        if "prompt" in arguments:
+            prompt = arguments["prompt"]
+            if prompt is not None and not isinstance(prompt, str):
+                return _ToolValidationError(
+                    code="invalid_tool_request",
+                    message="structured_extract.prompt must be a string when provided",
+                )
+            normalized["prompt"] = prompt
+        if "section_key" in arguments:
+            section_key = arguments["section_key"]
+            if section_key is not None and (
+                not isinstance(section_key, str) or not section_key.strip()
+            ):
+                return _ToolValidationError(
+                    code="invalid_tool_request",
+                    message="structured_extract.section_key must be a non-empty string when provided",
+                )
+            normalized["section_key"] = section_key.strip() if isinstance(section_key, str) else None
+        if "max_chars" in arguments:
+            max_chars = arguments["max_chars"]
+            if not isinstance(max_chars, int) or max_chars <= 0:
+                return _ToolValidationError(
+                    code="invalid_tool_request",
+                    message="structured_extract.max_chars must be a positive integer",
+                )
+            normalized["max_chars"] = max_chars
+        return normalized
+
     allowed = {"keyword", "section_key", "max_matches", "context_chars"}
     if set(arguments.keys()) - allowed:
         return _ToolValidationError(
@@ -601,6 +677,130 @@ def _extract_retrieved_keys(tool_name: str, result: Any) -> list[str]:
         return [key for key in keys if key]
 
     return []
+
+
+def _seed_history_from_chat(
+    chat_history: list[dict[str, str]] | None,
+    *,
+    max_turns: int,
+) -> list[dict[str, Any]]:
+    if not chat_history:
+        return []
+
+    safe_max_turns = max(1, max_turns)
+    seeded: list[dict[str, Any]] = []
+    for turn in chat_history[-safe_max_turns:]:
+        if not isinstance(turn, dict):
+            continue
+
+        question = str(turn.get("question", "")).strip()
+        answer = str(turn.get("answer", "")).strip()
+        if question:
+            seeded.append({"role": "user", "question": question})
+        if answer:
+            seeded.append({"role": "assistant", "answer": answer})
+
+    return seeded
+
+
+def _compact_tool_result_for_history(*, tool_name: str, result: Any) -> Any:
+    if not isinstance(result, dict):
+        return _truncate_json_value(result)
+
+    if tool_name == "list_sections":
+        sections = result.get("sections")
+        section_items: list[dict[str, Any]] = []
+        if isinstance(sections, list):
+            for item in sections[:12]:
+                if not isinstance(item, dict):
+                    continue
+                section_items.append(
+                    {
+                        "key": item.get("key"),
+                        "title": item.get("title"),
+                        "level": item.get("level"),
+                    }
+                )
+        compact = {
+            "ok": result.get("ok"),
+            "document_id": result.get("document_id"),
+            "total_sections": result.get("total_sections"),
+            "sections": section_items,
+            "truncated": result.get("truncated")
+            or (isinstance(sections, list) and len(sections) > len(section_items)),
+            "truncated_for_history": True,
+        }
+        return _truncate_json_value(compact)
+
+    if tool_name == "read_section":
+        content = str(result.get("content", ""))
+        compact = {
+            "ok": result.get("ok"),
+            "document_id": result.get("document_id"),
+            "section": result.get("section"),
+            "content": content[:2000],
+            "truncated": result.get("truncated") or len(content) > 2000,
+            "truncated_for_history": len(content) > 2000,
+        }
+        return _truncate_json_value(compact)
+
+    if tool_name == "keyword_grep":
+        matches = result.get("matches")
+        compact_matches: list[dict[str, Any]] = []
+        if isinstance(matches, list):
+            for item in matches[:10]:
+                if not isinstance(item, dict):
+                    continue
+                compact_matches.append(
+                    {
+                        "match": item.get("match"),
+                        "section_key": item.get("section_key"),
+                        "line_start": item.get("line_start"),
+                        "line_end": item.get("line_end"),
+                        "snippet": str(item.get("snippet", ""))[:160],
+                    }
+                )
+        compact = {
+            "ok": result.get("ok"),
+            "document_id": result.get("document_id"),
+            "keyword": result.get("keyword"),
+            "total_matches": result.get("total_matches"),
+            "matches": compact_matches,
+            "truncated": result.get("truncated")
+            or (isinstance(matches, list) and len(matches) > len(compact_matches)),
+            "truncated_for_history": True,
+        }
+        return _truncate_json_value(compact)
+
+    if tool_name == "structured_extract":
+        compact = {
+            "ok": result.get("ok"),
+            "document_id": result.get("document_id"),
+            "data": result.get("data"),
+            "accepted_fields": result.get("accepted_fields"),
+            "rejected_fields": result.get("rejected_fields"),
+            "diagnostics": result.get("diagnostics"),
+            "error": result.get("error"),
+        }
+        return _truncate_json_value(compact)
+
+    return _truncate_json_value(result)
+
+
+def _truncate_json_value(value: Any, *, max_chars: int = 4000) -> Any:
+    try:
+        serialized = json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return value
+
+    if len(serialized) <= max_chars:
+        return value
+
+    return {
+        "truncated_for_history": True,
+        "preview": serialized[:max_chars],
+        "original_size_chars": len(serialized),
+    }
 
 
 def _latency_ms(started: float) -> int:

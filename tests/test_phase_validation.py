@@ -106,6 +106,7 @@ def _build_services(
         ingest_timeout_seconds=10,
         deep_mode_enabled=True,
         cloud_agent_provider="fallback",
+        cloud_agent_api_key=None,
     )
     index_store = HybridVectorIndexStore(
         cfg=cfg,

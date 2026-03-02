@@ -16,6 +16,7 @@ import src.api.main as api_main
 from src.api.main import ApiServices, app
 from src.api.state_store import InMemoryApiStateBackend, InMemoryApiStateStore
 from src.config.settings import Settings
+from src.engine.cloud_agent import CloudAgentEngine
 from src.engine.extractor import (
     FieldProvenance,
     StructuredExtractionEnvelope,
@@ -590,7 +591,7 @@ def test_healthz_prefers_gemini_when_api_key_is_configured(tmp_path: Path) -> No
         deep_mode_enabled=True,
         cloud_agent_provider="local",
         cloud_agent_api_key="test-key",
-        cloud_agent_model="gemini-3-flash",
+        cloud_agent_model="gemini-2.5-flash",
         ingestion_queue_backend="memory",
     )
 
@@ -602,7 +603,7 @@ def test_healthz_prefers_gemini_when_api_key_is_configured(tmp_path: Path) -> No
     assert body["deep_provider"]["provider"] == "gemini"
     assert body["deep_provider"]["ready"] is True
     assert body["deep_provider"]["reason"] == "api_key_present"
-    assert body["deep_provider"]["model"] == "gemini-3-flash"
+    assert body["deep_provider"]["model"] == "gemini-2.5-flash"
 
 
 def test_resolve_chat_model_routing_prefers_api_in_auto_when_key_available() -> None:
@@ -616,12 +617,31 @@ def test_resolve_chat_model_routing_prefers_api_in_auto_when_key_available() -> 
         cfg=cfg,
         model_backend_header="auto",
         api_key_header=None,
-        api_model_header="gemini-3-flash",
+        api_model_header="gemini-2.5-flash",
     )
 
     assert routing.use_api_model is True
     assert routing.api_key == "env-key"
-    assert routing.api_model == "gemini-3-flash"
+    assert routing.api_model == "gemini-2.5-flash"
+
+
+def test_resolve_chat_model_routing_ignores_non_pinned_api_model_override() -> None:
+    cfg = Settings(
+        deep_mode_enabled=True,
+        cloud_agent_provider="local",
+        cloud_agent_api_key="env-key",
+        cloud_agent_model="gemini-3-flash",
+    )
+
+    routing = api_main._resolve_chat_model_routing(
+        cfg=cfg,
+        model_backend_header="auto",
+        api_key_header=None,
+        api_model_header="gemini-3-flash",
+    )
+
+    assert routing.use_api_model is True
+    assert routing.api_model == "gemini-2.5-flash"
 
 
 def test_resolve_chat_model_routing_falls_back_to_local_without_key() -> None:
@@ -665,7 +685,7 @@ def test_should_auto_fallback_to_local_detects_deep_provider_failure() -> None:
         backend="auto",
         use_api_model=True,
         api_key="key-1",
-        api_model="gemini-3-flash",
+        api_model="gemini-2.5-flash",
     )
     response = ChatResponse(
         answer="provider failed",
@@ -674,7 +694,7 @@ def test_should_auto_fallback_to_local_detects_deep_provider_failure() -> None:
         insufficient_evidence=True,
         citations=[],
         trace=AgentTrace(
-            model="gemini-3-flash",
+            model="gemini-2.5-flash",
             iterations=1,
             termination_reason="provider_unavailable",
         ),
@@ -694,7 +714,7 @@ def test_should_auto_fallback_to_local_ignores_non_auto_backend() -> None:
         backend="api",
         use_api_model=True,
         api_key="key-1",
-        api_model="gemini-3-flash",
+        api_model="gemini-2.5-flash",
     )
     response = ChatResponse(
         answer="provider failed",
@@ -703,7 +723,7 @@ def test_should_auto_fallback_to_local_ignores_non_auto_backend() -> None:
         insufficient_evidence=True,
         citations=[],
         trace=AgentTrace(
-            model="gemini-3-flash",
+            model="gemini-2.5-flash",
             iterations=1,
             termination_reason="provider_unavailable",
         ),
@@ -716,6 +736,51 @@ def test_should_auto_fallback_to_local_ignores_non_auto_backend() -> None:
     )
 
     assert should_fallback is False
+
+
+def test_resolve_deep_lite_engine_caps_iterations_at_five(tmp_path: Path) -> None:
+    services = _make_services(tmp_path=tmp_path)
+
+    class StaticDecisionModel:
+        def next_step(
+            self,
+            *,
+            question: str,
+            mode: Mode,
+            document_id: str,
+            iteration: int,
+            history: list[dict[str, Any]],
+            allowed_tools: list[str],
+        ) -> dict[str, Any]:
+            del question, mode, document_id, iteration, history, allowed_tools
+            return {
+                "action": "final",
+                "answer": "ok",
+                "insufficient_evidence": False,
+            }
+
+    services.cloud_agent = cast(
+        Any,
+        CloudAgentEngine(
+            model_client=StaticDecisionModel(),
+            tool_provider=lambda _document_id: {},
+            max_iterations=9,
+        ),
+    )
+    routing = api_main._ChatModelRouting(
+        backend="local",
+        use_api_model=False,
+        api_key=None,
+        api_model="local",
+    )
+
+    resolved = api_main._resolve_deep_lite_engine_for_request(
+        services=services,
+        routing=routing,
+    )
+
+    assert isinstance(resolved, CloudAgentEngine)
+    assert resolved.max_iterations == 5
 
 
 def test_ask_deep_auto_falls_back_to_local_on_provider_unavailable(
@@ -984,6 +1049,7 @@ def test_healthz_readiness_actions_surface_deep_mode_blockers(tmp_path: Path) ->
     assert response.status_code == 200
     readiness = response.json()["readiness"]
     assert readiness["actions"]["ask_fast"]["ready"] is True
+    assert readiness["actions"]["ask_deep_lite"]["ready"] is False
     assert readiness["actions"]["ask_deep"]["ready"] is False
     deep_issues = readiness["actions"]["ask_deep"]["blocking_issues"]
     assert deep_issues[0]["code"] == "deep_mode_disabled"
@@ -997,7 +1063,7 @@ def test_healthz_readiness_actions_surface_deep_mode_blockers(tmp_path: Path) ->
             {
                 "docling_enabled": False,
                 "google_parser_enabled": False,
-                "langextract_enabled": False,
+                "langextract_enabled": True,
                 "parser_routing_mode": "fallback_only",
             },
         ),
@@ -1560,6 +1626,80 @@ def test_extract_returns_validation_diagnostics_for_provenance_mismatch(
     assert diagnostics[0]["code"] == "provenance_text_mismatch"
 
 
+def test_structured_extract_tool_truncates_long_inputs_to_budget(
+    tmp_path: Path,
+) -> None:
+    cfg = Settings(
+        data_dir=tmp_path,
+        extraction_max_input_tokens=40,
+        langextract_enabled=True,
+    )
+    cfg.ensure_runtime_dirs()
+
+    document_text = "# Agent Spec\n\n" + ("A" * 5000)
+    (cfg.parsed_dir / "doc-agent.md").write_text(document_text, encoding="utf-8")
+
+    structured_extractor = StubStructuredExtractor(
+        _success_extraction_envelope("doc-agent")
+    )
+
+    result = api_main._run_structured_extract_tool(
+        document_id="doc-agent",
+        schema={
+            "type": "object",
+            "properties": {"agent_type": {"type": "string"}},
+            "required": ["agent_type"],
+        },
+        prompt="Extract agent type",
+        section_key=None,
+        max_chars=None,
+        cfg=cfg,
+        structured_extractor=structured_extractor,
+    )
+
+    assert result["ok"] is True
+    assert result["source"]["input_was_truncated"] is True
+    assert structured_extractor.calls
+    _, called_text, _, _ = structured_extractor.calls[0]
+    assert len(called_text) < len(document_text)
+
+
+def test_structured_extract_tool_handles_provider_exception(
+    tmp_path: Path,
+) -> None:
+    cfg = Settings(data_dir=tmp_path, langextract_enabled=True)
+    cfg.ensure_runtime_dirs()
+    (cfg.parsed_dir / "doc-agent.md").write_text("# Agent\n\nType: retrieval", encoding="utf-8")
+
+    class RaisingExtractor:
+        def extract_structured(
+            self,
+            *,
+            document_id: str,
+            document_text: str,
+            schema: dict[str, Any],
+            prompt: str | None = None,
+        ) -> StructuredExtractionEnvelope:
+            del document_id, document_text, schema, prompt
+            raise RuntimeError("boom")
+
+    result = api_main._run_structured_extract_tool(
+        document_id="doc-agent",
+        schema={
+            "type": "object",
+            "properties": {"agent_type": {"type": "string"}},
+        },
+        prompt="Extract",
+        section_key=None,
+        max_chars=None,
+        cfg=cfg,
+        structured_extractor=cast(Any, RaisingExtractor()),
+    )
+
+    assert result["ok"] is False
+    assert result["error"]["code"] == "provider_error"
+
+
 def test_ask_fast_mode_routes_to_local_engine(tmp_path: Path) -> None:
     local = StubLocalQAEngine()
     cloud = StubCloudAgentEngine()
@@ -1575,6 +1715,27 @@ def test_ask_fast_mode_routes_to_local_engine(tmp_path: Path) -> None:
     assert response.json()["answer"] == "local-answer"
     assert len(local.calls) == 1
     assert len(cloud.calls) == 0
+
+
+def test_ask_deep_lite_mode_routes_to_cloud_engine(tmp_path: Path) -> None:
+    local = StubLocalQAEngine()
+    cloud = StubCloudAgentEngine()
+    services = _make_services(tmp_path=tmp_path, local_qa=local, cloud_agent=cloud)
+
+    with _client_with_services(services) as client:
+        response = client.post(
+            "/ask",
+            json={
+                "question": "Find cancellation clause",
+                "mode": "deep-lite",
+                "document_id": "doc-2",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json()["answer"] == "cloud-answer"
+    assert len(local.calls) == 0
+    assert len(cloud.calls) == 1
 
 
 def test_ask_deep_mode_routes_to_cloud_engine(tmp_path: Path) -> None:
@@ -1733,6 +1894,66 @@ def test_ask_stream_with_session_id_reuses_previous_turn_context(
     ]
 
 
+def test_ask_deep_lite_with_session_id_passes_history_into_agent(
+    tmp_path: Path,
+) -> None:
+    history_sizes: list[int] = []
+
+    class HistoryAwareModel:
+        def next_step(
+            self,
+            *,
+            question: str,
+            mode: Mode,
+            document_id: str,
+            iteration: int,
+            history: list[dict[str, Any]],
+            allowed_tools: list[str],
+        ) -> dict[str, Any]:
+            del question, mode, document_id, iteration, allowed_tools
+            history_sizes.append(len(history))
+            return {
+                "action": "final",
+                "answer": "deep-lite-answer",
+                "insufficient_evidence": False,
+            }
+
+    services = _make_services(tmp_path=tmp_path)
+    services.cloud_agent = cast(
+        Any,
+        CloudAgentEngine(
+            model_client=HistoryAwareModel(),
+            tool_provider=lambda _document_id: {},
+            max_iterations=5,
+        ),
+    )
+
+    with _client_with_services(services) as client:
+        first = client.post(
+            "/ask",
+            json={
+                "question": "Tell me about plant agents",
+                "mode": "deep-lite",
+                "document_id": "doc-1",
+                "session_id": "session-deep-lite-1",
+            },
+        )
+        second = client.post(
+            "/ask",
+            json={
+                "question": "Now give it as structured output",
+                "mode": "deep-lite",
+                "document_id": "doc-1",
+                "session_id": "session-deep-lite-1",
+            },
+        )
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert history_sizes[0] == 0
+    assert history_sizes[1] >= 2
+
+
 def test_ingest_idempotency_replay_survives_service_restart(tmp_path: Path) -> None:
     shared_backend = InMemoryApiStateBackend()
 
@@ -1846,6 +2067,37 @@ def test_ask_stream_fast_mode_emits_tokens_and_final_event(tmp_path: Path) -> No
     assert second["delta"] == "local-answer"
     assert last["type"] == "final"
     assert last["response"]["answer"] == "local-answer"
+
+
+def test_ask_stream_deep_lite_mode_emits_single_response_events(tmp_path: Path) -> None:
+    local = StubLocalQAEngine()
+    cloud = StubCloudAgentEngine()
+    services = _make_services(tmp_path=tmp_path, local_qa=local, cloud_agent=cloud)
+
+    with _client_with_services(services) as client:
+        response = client.post(
+            "/ask/stream",
+            json={
+                "question": "Give me a deep-lite answer",
+                "mode": "deep-lite",
+                "document_id": "doc-1",
+            },
+        )
+
+    assert response.status_code == 200
+    lines = [line for line in response.text.splitlines() if line.strip()]
+    assert len(lines) >= 3
+
+    first = json.loads(lines[0])
+    token_events = [json.loads(line) for line in lines[1:-1]]
+    last = json.loads(lines[-1])
+
+    assert first["type"] == "status"
+    assert first["phase"] == "generation"
+    assert all(event["type"] == "token" for event in token_events)
+    assert "".join(event["delta"] for event in token_events) == "cloud-answer"
+    assert last["type"] == "final"
+    assert last["response"]["answer"] == "cloud-answer"
 
 
 def test_ask_stream_deep_mode_emits_normalized_events(tmp_path: Path) -> None:

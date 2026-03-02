@@ -14,7 +14,12 @@ def classify_runtime_readiness(
     optional: list[str] = []
 
     if isinstance(readiness, Mapping):
-        action_key = "ask_deep" if chat_mode == "deep" else "ask_fast"
+        if chat_mode == "deep":
+            action_key = "ask_deep"
+        elif chat_mode == "deep-lite":
+            action_key = "ask_deep_lite"
+        else:
+            action_key = "ask_fast"
         actions = readiness.get("actions")
         if isinstance(actions, Mapping):
             action_report = actions.get(action_key)

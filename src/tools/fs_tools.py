@@ -244,16 +244,71 @@ class MarkdownFSTools:
         }
 
 
-def get_fs_tools(document_id: str, cfg: Settings = settings) -> dict[str, Any]:
-    markdown_path = _resolve_markdown_path(document_id=document_id, cfg=cfg)
-    tools = MarkdownFSTools.from_file(
-        document_id=document_id, markdown_path=markdown_path
+def load_markdown_scope(document_id: str, cfg: Settings = settings) -> tuple[str, str]:
+    normalized_document_id = (document_id or "").strip()
+    if _is_all_documents_scope(normalized_document_id):
+        return "all-documents", _build_all_documents_markdown(cfg=cfg)
+
+    markdown_path = _resolve_markdown_path(
+        document_id=normalized_document_id,
+        cfg=cfg,
     )
+    markdown_text = markdown_path.read_text(encoding="utf-8")
+    return normalized_document_id, markdown_text
+
+
+def get_fs_tools(document_id: str, cfg: Settings = settings) -> dict[str, Any]:
+    scoped_document_id, markdown_text = load_markdown_scope(document_id=document_id, cfg=cfg)
+    tools = MarkdownFSTools(
+        document_id=scoped_document_id,
+        markdown_text=markdown_text,
+    )
+
     return {
         "list_sections": tools.list_sections,
         "read_section": tools.read_section,
         "keyword_grep": tools.keyword_grep,
     }
+
+
+def _is_all_documents_scope(document_id: str) -> bool:
+    normalized = (document_id or "").strip().lower()
+    return normalized in {"", "*", "all", "__all_documents__", "all-documents"}
+
+
+def _build_all_documents_markdown(*, cfg: Settings) -> str:
+    parsed_files = sorted(path for path in cfg.parsed_dir.glob("*.md") if path.is_file())
+    if not parsed_files:
+        raise FileNotFoundError(
+            f"no parsed markdown artifacts found in {cfg.parsed_dir}"
+        )
+
+    document_sections: list[str] = []
+    for parsed_file in parsed_files:
+        content = parsed_file.read_text(encoding="utf-8").strip()
+        if not content:
+            continue
+
+        doc_title = _parsed_artifact_title(parsed_file=parsed_file, content=content)
+        doc_id = parsed_file.stem
+        document_sections.append(
+            f"## {doc_title} [{doc_id}]\n\n{content}"
+        )
+
+    if not document_sections:
+        raise FileNotFoundError(
+            f"parsed markdown artifacts were empty in {cfg.parsed_dir}"
+        )
+
+    return "# All indexed documents\n\n" + "\n\n---\n\n".join(document_sections)
+
+
+def _parsed_artifact_title(*, parsed_file: Path, content: str) -> str:
+    for line in content.splitlines()[:40]:
+        heading = _HEADING_RE.match(line)
+        if heading:
+            return heading.group(2).strip()
+    return parsed_file.stem
 
 
 def _resolve_markdown_path(document_id: str, cfg: Settings) -> Path:

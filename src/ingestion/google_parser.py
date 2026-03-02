@@ -5,7 +5,7 @@ import mimetypes
 from dataclasses import dataclass
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from typing import Any, Protocol
 from urllib import error, request
 
 from src.config.settings import Settings, settings

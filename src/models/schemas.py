@@ -14,6 +14,7 @@ def _utcnow() -> datetime:
 
 class Mode(str, Enum):
     FAST = "fast"
+    DEEP_LITE = "deep-lite"
     DEEP = "deep"
 
 

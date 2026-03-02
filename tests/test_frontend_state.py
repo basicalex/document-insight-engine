@@ -32,8 +32,8 @@ def test_initialize_session_state_sets_expected_defaults() -> None:
     assert state["extract_schema_text"] == DEFAULT_EXTRACTION_SCHEMA
     assert state["extract_prompt"]
     assert state["last_extract_result"] is None
-    assert state["model_backend"] == "auto"
-    assert state["api_model"] == "gemini-3-flash"
+    assert state["model_backend"] == "local"
+    assert state["api_model"] == "gemini-2.5-flash"
     assert state["api_key"] == ""
 
 
@@ -68,6 +68,15 @@ def test_set_mode_rejects_unknown_values() -> None:
 
     with pytest.raises(ValueError, match="unsupported mode"):
         set_mode(state, "turbo")
+
+
+def test_set_mode_accepts_deep_lite() -> None:
+    state: dict[str, Any] = {}
+    initialize_session_state(state)
+
+    set_mode(state, "deep-lite")
+
+    assert state["chat_mode"] == "deep-lite"
 
 
 def test_chat_message_helpers_append_messages_and_clear() -> None:

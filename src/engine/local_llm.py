@@ -154,8 +154,12 @@ class OllamaHTTPClient:
         try:
             with urllib_request.urlopen(request, timeout=timeout_seconds) as response:
                 raw = response.read().decode("utf-8")
+        except urllib_error.HTTPError as exc:
+            raise OllamaGenerateError(_format_ollama_http_error(exc)) from exc
         except urllib_error.URLError as exc:
             raise OllamaGenerateError(f"Ollama request failed: {exc}") from exc
+        except TimeoutError as exc:
+            raise OllamaGenerateError("Ollama request timed out") from exc
 
         try:
             decoded = json.loads(raw)
@@ -212,8 +216,12 @@ class OllamaHTTPClient:
 
                     if bool(decoded.get("done", False)):
                         break
+        except urllib_error.HTTPError as exc:
+            raise OllamaGenerateError(_format_ollama_http_error(exc)) from exc
         except urllib_error.URLError as exc:
             raise OllamaGenerateError(f"Ollama request failed: {exc}") from exc
+        except TimeoutError as exc:
+            raise OllamaGenerateError("Ollama streaming request timed out") from exc
 
 
 class GeminiTextGenerationClient:
@@ -262,11 +270,11 @@ class GeminiTextGenerationClient:
             with urllib_request.urlopen(request, timeout=timeout_seconds) as response:
                 raw = response.read().decode("utf-8")
         except urllib_error.HTTPError as exc:
-            raise OllamaGenerateError(
-                f"Gemini request failed with status {exc.code}"
-            ) from exc
+            raise OllamaGenerateError(_format_gemini_http_error(exc)) from exc
         except urllib_error.URLError as exc:
             raise OllamaGenerateError(f"Gemini request failed: {exc}") from exc
+        except TimeoutError as exc:
+            raise OllamaGenerateError("Gemini request timed out") from exc
 
         try:
             decoded = json.loads(raw)
@@ -372,9 +380,11 @@ class LocalQAEngine:
         chat_history: list[dict[str, str]] | None = None,
     ) -> ChatResponse:
         started = time.perf_counter()
+        retrieval_top_k = self._retrieval_top_k_for_mode(mode)
         raw_matches, retrieval_latency_ms = self._retrieve_matches(
             question=question,
             document_id=document_id,
+            retrieval_top_k=retrieval_top_k,
         )
 
         evidence = [_to_evidence(match) for match in raw_matches]
@@ -389,7 +399,7 @@ class LocalQAEngine:
                 metadata={
                     "document_id": document_id or "*",
                     "retrieved": str(len(evidence)),
-                    "top_k": str(self.retrieval_top_k),
+                    "top_k": str(retrieval_top_k),
                 },
             )
         ]
@@ -433,12 +443,22 @@ class LocalQAEngine:
                 prompt=prompt,
                 timeout_seconds=self.cfg.request_timeout_seconds,
             )
-        except OllamaGenerateError:
+        except (OllamaGenerateError, TimeoutError) as exc:
+            normalized_error = (
+                exc
+                if isinstance(exc, OllamaGenerateError)
+                else OllamaGenerateError("Local generation request timed out")
+            )
+            answer = _local_generation_failure_answer(
+                model=self.generation_model,
+                error=normalized_error,
+            )
             trace_events.append(
                 TraceEvent(
                     stage="generation",
                     message="local generation failed",
                     latency_ms=_latency_ms(generation_started),
+                    metadata={"error": str(normalized_error)},
                 )
             )
             trace = AgentTrace(
@@ -450,10 +470,7 @@ class LocalQAEngine:
                 total_latency_ms=_latency_ms(started),
             )
             return ChatResponse(
-                answer=(
-                    "I could not complete local generation right now. Please retry or "
-                    "switch to deep mode."
-                ),
+                answer=answer,
                 mode=mode,
                 document_id=document_id,
                 insufficient_evidence=True,
@@ -513,9 +530,11 @@ class LocalQAEngine:
         }
 
         started = time.perf_counter()
+        retrieval_top_k = self._retrieval_top_k_for_mode(mode)
         raw_matches, retrieval_latency_ms = self._retrieve_matches(
             question=question,
             document_id=document_id,
+            retrieval_top_k=retrieval_top_k,
         )
 
         evidence = [_to_evidence(match) for match in raw_matches]
@@ -530,7 +549,7 @@ class LocalQAEngine:
                 metadata={
                     "document_id": document_id or "*",
                     "retrieved": str(len(evidence)),
-                    "top_k": str(self.retrieval_top_k),
+                    "top_k": str(retrieval_top_k),
                 },
             )
         ]
@@ -600,16 +619,22 @@ class LocalQAEngine:
                 if answer:
                     chunks.append(answer)
                     yield {"type": "token", "delta": answer}
-        except OllamaGenerateError:
-            answer = (
-                "I could not complete local generation right now. Please retry or "
-                "switch to deep mode."
+        except (OllamaGenerateError, TimeoutError) as exc:
+            normalized_error = (
+                exc
+                if isinstance(exc, OllamaGenerateError)
+                else OllamaGenerateError("Local generation request timed out")
+            )
+            answer = _local_generation_failure_answer(
+                model=self.generation_model,
+                error=normalized_error,
             )
             trace_events.append(
                 TraceEvent(
                     stage="generation",
                     message="local generation failed",
                     latency_ms=_latency_ms(generation_started),
+                    metadata={"error": str(normalized_error)},
                 )
             )
             response = ChatResponse(
@@ -675,8 +700,14 @@ class LocalQAEngine:
         *,
         question: str,
         document_id: str | None,
+        retrieval_top_k: int,
     ) -> tuple[list[QueryMatch], int]:
         retrieval_started = time.perf_counter()
+        keyword_tokens = _keyword_query_tokens(question)
+        search_top_k = _expanded_retrieval_top_k(
+            base_top_k=retrieval_top_k,
+            keyword_tokens=keyword_tokens,
+        )
 
         for candidate in self._query_candidates(question):
             filters = self._candidate_filters(
@@ -686,13 +717,23 @@ class LocalQAEngine:
             matches = self.index_store.query(
                 tier=EmbeddingTier.TIER1,
                 vector=candidate.vector,
-                top_k=self.retrieval_top_k,
+                top_k=search_top_k,
                 filters=filters,
             )
-            if matches:
-                return matches, _latency_ms(retrieval_started)
+            prioritized = _prioritize_keyword_matches(
+                matches=matches,
+                keyword_tokens=keyword_tokens,
+                limit=retrieval_top_k,
+            )
+            if prioritized:
+                return prioritized, _latency_ms(retrieval_started)
 
         return [], _latency_ms(retrieval_started)
+
+    def _retrieval_top_k_for_mode(self, mode: Mode) -> int:
+        if mode == Mode.DEEP_LITE:
+            return max(self.retrieval_top_k, 12)
+        return self.retrieval_top_k
 
     def _query_candidates(self, question: str) -> list[QueryEmbeddingCandidate]:
         candidate_fn = getattr(self.embedder, "embed_query_candidates", None)
@@ -871,6 +912,78 @@ def _parse_page_refs(raw_pages: Any) -> list[int]:
     return sorted(set(page_refs))
 
 
+def _format_ollama_http_error(exc: urllib_error.HTTPError) -> str:
+    detail = ""
+    try:
+        payload = exc.read().decode("utf-8").strip()
+    except Exception:
+        payload = ""
+
+    if payload:
+        try:
+            decoded = json.loads(payload)
+        except json.JSONDecodeError:
+            decoded = None
+
+        if isinstance(decoded, dict):
+            detail = str(decoded.get("error") or "").strip() or payload
+        else:
+            detail = payload
+
+    if detail:
+        return f"Ollama request failed with status {exc.code}: {detail}"
+    return f"Ollama request failed with status {exc.code}"
+
+
+def _format_gemini_http_error(exc: urllib_error.HTTPError) -> str:
+    detail = ""
+    try:
+        payload = exc.read().decode("utf-8").strip()
+    except Exception:
+        payload = ""
+
+    if payload:
+        try:
+            decoded = json.loads(payload)
+        except json.JSONDecodeError:
+            decoded = None
+
+        if isinstance(decoded, dict):
+            error_obj = decoded.get("error")
+            if isinstance(error_obj, dict):
+                detail = str(error_obj.get("message") or "").strip()
+            if not detail:
+                detail = payload
+        else:
+            detail = payload
+
+    if detail:
+        compact = " ".join(detail.split())
+        return f"Gemini request failed with status {exc.code}: {compact[:500]}"
+    return f"Gemini request failed with status {exc.code}"
+
+
+def _local_generation_failure_answer(*, model: str, error: OllamaGenerateError) -> str:
+    message = str(error).strip()
+    lowered = message.lower()
+    if "not found" in lowered or "no such model" in lowered:
+        return (
+            f"Local model '{model}' is not available in Ollama. "
+            f'Run: ollama pull "{model}" and retry.'
+        )
+    if "gemini request failed with status 429" in lowered:
+        return (
+            "API generation is currently rate-limited (Gemini 2.5). "
+            "Retry shortly or switch Model backend to local/auto."
+        )
+    if "gemini request failed" in lowered:
+        return (
+            "API generation failed for Gemini 2.5. "
+            "Check API key/quota or switch Model backend to local/auto."
+        )
+    return "I could not complete local generation right now. Please retry or switch to deep mode."
+
+
 def _is_insufficient_evidence(
     question: str,
     evidence: list[RetrievedEvidence],
@@ -889,6 +1002,48 @@ def _is_insufficient_evidence(
     evidence_tokens = set(_tokenize(combined))
     overlap = question_tokens.intersection(evidence_tokens)
     return len(overlap) < min_token_overlap
+
+
+def _keyword_query_tokens(question: str) -> set[str]:
+    return {token for token in _tokenize(question) if len(token) >= 3}
+
+
+def _expanded_retrieval_top_k(*, base_top_k: int, keyword_tokens: set[str]) -> int:
+    if not keyword_tokens or len(keyword_tokens) > 2:
+        return base_top_k
+    return max(base_top_k, min(50, base_top_k * 6))
+
+
+def _keyword_overlap_count(*, text: str, keyword_tokens: set[str]) -> int:
+    if not keyword_tokens:
+        return 0
+    text_tokens = set(_tokenize(text))
+    return len(text_tokens.intersection(keyword_tokens))
+
+
+def _prioritize_keyword_matches(
+    *,
+    matches: list[QueryMatch],
+    keyword_tokens: set[str],
+    limit: int,
+) -> list[QueryMatch]:
+    if limit <= 0 or not matches:
+        return []
+    if not keyword_tokens:
+        return matches[:limit]
+
+    scored: list[tuple[int, int, QueryMatch]] = []
+    for index, match in enumerate(matches):
+        text = str(match.payload.get("text", ""))
+        overlap = _keyword_overlap_count(text=text, keyword_tokens=keyword_tokens)
+        scored.append((overlap, index, match))
+
+    has_overlap = any(overlap > 0 for overlap, _, _ in scored)
+    if not has_overlap:
+        return matches[:limit]
+
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    return [match for _, _, match in scored[:limit]]
 
 
 def _tokenize(text: str) -> list[str]:

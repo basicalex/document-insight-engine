@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import queue
+import threading
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, Iterator
 
 import streamlit as st
 
 from frontend.client import ApiError, DocumentInsightApi
+from frontend.progress import normalize_ingest_progress
 from frontend.readiness import classify_runtime_readiness
 from frontend.state import (
     DEFAULT_API_BASE_URL,
@@ -53,6 +57,7 @@ def main() -> None:
         layout="wide",
     )
     initialize_session_state_with_url_params()
+    _apply_compact_sidebar_spacing()
 
     st.title("Document Insight Engine")
     st.caption("Upload a document, switch answer depth, and inspect grounded traces.")
@@ -61,9 +66,27 @@ def main() -> None:
     _render_status_bar()
     _render_runtime_readiness_banner()
     _render_observability_panel()
-    _render_extraction_result()
     _render_chat_history()
     _handle_chat_prompt()
+
+
+def _apply_compact_sidebar_spacing() -> None:
+    st.markdown(
+        """
+        <style>
+        [data-testid="stSidebar"] [data-testid="stSidebarUserContent"],
+        [data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+            padding-top: 0.25rem;
+        }
+
+        [data-testid="stSidebar"] .block-container {
+            padding-top: 0.25rem;
+            padding-bottom: 0.5rem;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def _render_sidebar() -> None:
@@ -74,10 +97,14 @@ def _render_sidebar() -> None:
     base_url_value = str(base_url or "").strip()
     st.session_state["api_base_url"] = base_url_value or DEFAULT_API_BASE_URL
 
-    mode_index = 0 if st.session_state["chat_mode"] == "fast" else 1
+    mode_options = ["fast", "deep-lite", "deep"]
+    current_mode = str(st.session_state.get("chat_mode", "fast"))
+    mode_index = (
+        mode_options.index(current_mode) if current_mode in mode_options else 0
+    )
     selected_mode = st.sidebar.radio(
         "Answer mode",
-        options=["fast", "deep"],
+        options=mode_options,
         index=mode_index,
         horizontal=True,
     )
@@ -93,16 +120,12 @@ def _render_sidebar() -> None:
             else "auto"
         ),
         horizontal=True,
-        help="auto uses API model when key is available, otherwise local model",
+        help="auto uses API model when key is available (with local fallback on failures), otherwise local model. api forces API only.",
     )
     st.session_state["model_backend"] = str(model_backend)
 
-    api_model = st.sidebar.text_input(
-        "API model",
-        value=st.session_state["api_model"],
-        placeholder="gemini-3-flash",
-    )
-    st.session_state["api_model"] = str(api_model or "").strip()
+    st.session_state["api_model"] = "gemini-2.5-flash"
+    st.sidebar.caption("API model is pinned to gemini-2.5-flash")
 
     api_key = st.sidebar.text_input(
         "API key (optional)",
@@ -117,9 +140,22 @@ def _render_sidebar() -> None:
     history = st.session_state.get("ingest_history", [])
     recent_docs = []
     seen = set()
+    labels_by_doc_id: dict[str, str] = {}
     for item in reversed(history):
-        doc_id = item.get("document_id")
-        if doc_id and doc_id not in seen:
+        if not isinstance(item, dict):
+            continue
+
+        doc_id = str(item.get("document_id") or "").strip()
+        if not doc_id:
+            continue
+
+        file_path = str(item.get("file_path") or "").strip()
+        file_name = Path(file_path).name if file_path else ""
+        if file_name.startswith(f"{doc_id}_"):
+            file_name = file_name[len(doc_id) + 1 :]
+        labels_by_doc_id[doc_id] = file_name or doc_id
+
+        if doc_id not in seen:
             seen.add(doc_id)
             recent_docs.append(doc_id)
 
@@ -131,11 +167,18 @@ def _render_sidebar() -> None:
     options = [""] + recent_docs
     index = options.index(active_doc) if active_doc in options else 0
 
+    def _doc_option_label(doc_id: str) -> str:
+        if not doc_id:
+            return "All indexed documents"
+        title = labels_by_doc_id.get(doc_id, doc_id)
+        short_id = doc_id[:8]
+        return f"{title} · {short_id}"
+
     document_id_value = st.sidebar.selectbox(
-        "Document ID",
+        "Document scope",
         options=options,
         index=index,
-        format_func=lambda x: x if x else "None (Select or upload)",
+        format_func=_doc_option_label,
     )
 
     if document_id_value != active_doc:
@@ -145,13 +188,6 @@ def _render_sidebar() -> None:
         else:
             if "doc" in st.query_params:
                 del st.query_params["doc"]
-
-    session_id_value = st.sidebar.text_input(
-        "Session ID (optional)",
-        value=st.session_state["session_id"],
-        placeholder="chat_session_1",
-    )
-    st.session_state["session_id"] = str(session_id_value or "").strip()
 
     uploaded_files = st.sidebar.file_uploader(
         "Upload file(s)",
@@ -168,37 +204,6 @@ def _render_sidebar() -> None:
     ):
         _refresh_ingest_status(st.session_state["active_document_id"])
 
-    st.sidebar.divider()
-    st.sidebar.subheader("Runtime")
-    if st.sidebar.button("Refresh runtime + metrics", use_container_width=True):
-        _refresh_runtime_data(silent=False)
-
-    st.sidebar.divider()
-    st.sidebar.subheader("Structured extract")
-    schema_text = st.sidebar.text_area(
-        "Schema JSON",
-        value=st.session_state["extract_schema_text"],
-        height=180,
-    )
-    st.session_state["extract_schema_text"] = schema_text
-    extract_prompt = st.sidebar.text_input(
-        "Extract prompt",
-        value=st.session_state["extract_prompt"],
-        placeholder="Extract requested fields with provenance",
-    )
-    st.session_state["extract_prompt"] = str(extract_prompt or "")
-
-    if st.sidebar.button(
-        "Run structured extract",
-        use_container_width=True,
-        disabled=not st.session_state["active_document_id"],
-    ):
-        _run_structured_extract(
-            document_id=st.session_state["active_document_id"],
-            schema_text=st.session_state["extract_schema_text"],
-            prompt=st.session_state["extract_prompt"],
-        )
-
     if st.sidebar.button("Clear chat", use_container_width=True):
         clear_chat(st.session_state)
 
@@ -207,7 +212,8 @@ def _render_status_bar() -> None:
     status_cols = st.columns(4)
     status_cols[0].metric("Mode", st.session_state["chat_mode"])
 
-    active_document = st.session_state["active_document_id"] or "none"
+    active_document_id = str(st.session_state["active_document_id"] or "").strip()
+    active_document = active_document_id or "none"
     status_cols[1].metric("Document", active_document)
 
     status_cols[2].metric("Turns", str(len(st.session_state["messages"])))
@@ -219,6 +225,12 @@ def _render_status_bar() -> None:
         or latest_ingest_status
     )
     status_cols[3].metric("Runtime", runtime_status)
+
+    if not active_document_id:
+        st.info(
+            "Document scope is set to all indexed documents. Answers and citations may mix content across files. "
+            "Select a specific document in the sidebar for focused retrieval."
+        )
 
 
 def _handle_upload(uploaded_files: list[Any]) -> None:
@@ -258,7 +270,55 @@ def _handle_upload(uploaded_files: list[Any]) -> None:
         if document_id:
             st.session_state["active_document_id"] = document_id
             st.query_params["doc"] = document_id
+
+            status = str(latest.get("status") or "").strip().lower()
+            if status in {"uploaded", "processing"}:
+                _monitor_uploaded_document_progress(document_id=document_id)
         st.sidebar.success(f"Ingested {len(records)} document(s)")
+
+
+def _monitor_uploaded_document_progress(
+    *,
+    document_id: str,
+    timeout_seconds: float = 180.0,
+) -> None:
+    if not document_id:
+        return
+
+    with st.sidebar:
+        status_placeholder = st.empty()
+        progress_placeholder = st.empty()
+    status_placeholder.markdown("_Waiting for indexing to start..._")
+
+    try:
+        with DocumentInsightApi(base_url=st.session_state["api_base_url"]) as api:
+            latest = _wait_for_document_indexed(
+                api=api,
+                document_id=document_id,
+                placeholder=status_placeholder,
+                progress_placeholder=progress_placeholder,
+                timeout_seconds=timeout_seconds,
+                poll_interval_seconds=1.0,
+            )
+    except ApiError as exc:
+        progress_placeholder.empty()
+        status_placeholder.warning(
+            "Upload succeeded, but status polling failed: " + _format_api_error(exc)
+        )
+        return
+
+    status = str(latest.get("status") or "").strip().lower()
+    progress_placeholder.empty()
+    if status == "indexed":
+        status_placeholder.success(
+            "Ingestion completed: indexed and ready for retrieval."
+        )
+    elif status in {"partial", "failed"}:
+        status_placeholder.warning(f"Ingestion finished with status: {status}.")
+    else:
+        status_placeholder.info(
+            "Ingestion is still running. You can continue and refresh status as needed."
+        )
 
 
 def _refresh_ingest_status(document_id: str) -> None:
@@ -330,9 +390,7 @@ def _run_structured_extract(*, document_id: str, schema_text: str, prompt: str) 
 def _render_runtime_readiness_banner() -> None:
     runtime = st.session_state.get("runtime_health") or {}
     if not runtime:
-        st.info(
-            "Runtime status not loaded yet. Use 'Refresh runtime + metrics' in sidebar."
-        )
+        st.info("Runtime status not loaded yet.")
         return
 
     chat_mode = st.session_state.get("chat_mode", "fast")
@@ -383,6 +441,10 @@ def _render_chat_history() -> None:
 
     for message in st.session_state["messages"]:
         with st.chat_message(message["role"]):
+            if message["role"] == "assistant":
+                backend_label = str(message.get("backend_label") or "").strip()
+                if backend_label:
+                    st.caption(backend_label)
             st.markdown(message["content"])
             if message["role"] == "assistant":
                 _render_assistant_details(message)
@@ -399,6 +461,7 @@ def _handle_chat_prompt() -> None:
 
     with st.chat_message("assistant"):
         answer_placeholder = st.empty()
+        progress_placeholder = st.empty()
         answer_placeholder.markdown("_Starting response..._")
         active_document_id = st.session_state["active_document_id"] or None
         try:
@@ -424,6 +487,7 @@ def _handle_chat_prompt() -> None:
                             api=api,
                             document_id=active_document_id,
                             placeholder=answer_placeholder,
+                            progress_placeholder=progress_placeholder,
                         )
                         status = str(status_payload.get("status", "")).strip().lower()
                         if status == "indexed":
@@ -453,23 +517,34 @@ def _handle_chat_prompt() -> None:
                     else:
                         raise
         except ApiError as exc:
+            progress_placeholder.empty()
             error_text = _format_api_error(exc)
             append_assistant_message(
                 st.session_state,
                 content=error_text,
                 mode=st.session_state["chat_mode"],
-                insufficient_evidence=True,
+                insufficient_evidence=False,
                 citations=[],
                 trace=None,
             )
             st.error(error_text)
             return
 
+        progress_placeholder.empty()
         answer = str(response.get("answer", ""))
         mode = str(response.get("mode", st.session_state["chat_mode"]))
         insufficient_evidence = bool(response.get("insufficient_evidence", False))
         citations = response.get("citations") if isinstance(response, dict) else []
         trace = response.get("trace") if isinstance(response, dict) else None
+        backend_label = _infer_response_backend_label(
+            response=response,
+            model_backend=st.session_state.get("model_backend"),
+            api_key=st.session_state.get("api_key"),
+            api_model=st.session_state.get("api_model"),
+        )
+
+        if backend_label:
+            st.caption(backend_label)
 
         append_assistant_message(
             st.session_state,
@@ -478,9 +553,144 @@ def _handle_chat_prompt() -> None:
             insufficient_evidence=insufficient_evidence,
             citations=citations if isinstance(citations, list) else [],
             trace=trace if isinstance(trace, dict) else None,
+            backend_label=backend_label,
         )
 
         _render_assistant_details(st.session_state["messages"][-1])
+
+
+def _events_with_wait_feedback(*, events: Any, mode: str) -> Iterator[dict[str, Any]]:
+    event_queue: queue.Queue[tuple[str, Any]] = queue.Queue()
+    completed = threading.Event()
+
+    def _pump() -> None:
+        try:
+            for event in events:
+                event_queue.put(("event", event))
+        except Exception as exc:
+            event_queue.put(("error", exc))
+        finally:
+            completed.set()
+
+    threading.Thread(target=_pump, name="chat-stream-pump", daemon=True).start()
+
+    if mode == "deep":
+        waiting_message = "Deep mode is reasoning through the document"
+    elif mode == "deep-lite":
+        waiting_message = "Deep-lite mode is synthesizing grounded evidence"
+    else:
+        waiting_message = "Generating answer"
+    started = time.monotonic()
+    first_event_received = False
+    last_reported_second = -1
+
+    while not completed.is_set() or not event_queue.empty():
+        try:
+            item_type, payload = event_queue.get(timeout=1.0)
+        except queue.Empty:
+            if first_event_received:
+                continue
+            elapsed_seconds = int(time.monotonic() - started)
+            if elapsed_seconds <= 0 or elapsed_seconds == last_reported_second:
+                continue
+            last_reported_second = elapsed_seconds
+            yield {
+                "type": "status",
+                "phase": "generation",
+                "message": f"{waiting_message} ({elapsed_seconds}s elapsed)",
+            }
+            continue
+
+        if item_type == "error":
+            raise payload
+        first_event_received = True
+        if isinstance(payload, dict):
+            yield payload
+
+
+def _normalized_model_backend(model_backend: str | None) -> str:
+    normalized = str(model_backend or "").strip().lower()
+    if normalized in {"auto", "api", "local"}:
+        return normalized
+    return "auto"
+
+
+def _should_retry_with_local_model(
+    *,
+    error: ApiError,
+    chat_mode: str,
+    model_backend: str | None,
+) -> bool:
+    if chat_mode not in {"deep", "deep-lite"}:
+        return False
+    if _normalized_model_backend(model_backend) == "local":
+        return False
+
+    retryable_codes = {
+        "provider_not_configured",
+        "provider_auth_failed",
+        "provider_rate_limited",
+        "provider_timeout",
+        "provider_unavailable",
+        "provider_malformed_response",
+        "ask_timeout",
+    }
+    if error.code in retryable_codes:
+        return True
+    return error.status_code in {429, 503, 504}
+
+
+def _backend_marker_from_trace(
+    *,
+    response: dict[str, Any],
+    api_model: str | None,
+) -> str | None:
+    trace = response.get("trace")
+    if not isinstance(trace, dict):
+        return None
+
+    model_name = str(trace.get("model") or "").strip().lower()
+    if not model_name:
+        return None
+
+    normalized_api_model = str(api_model or "").strip().lower()
+    if "gemini" in model_name:
+        return "api"
+    if normalized_api_model and model_name == normalized_api_model:
+        return "api"
+    return "local"
+
+
+def _infer_response_backend_label(
+    *,
+    response: dict[str, Any],
+    model_backend: str | None,
+    api_key: str | None,
+    api_model: str | None,
+) -> str:
+    explicit_marker = str(response.get("_response_backend") or "").strip().lower()
+    if explicit_marker == "local-fallback":
+        return "Backend: local (fallback)"
+    if explicit_marker == "api":
+        return "Backend: api"
+    if explicit_marker == "local":
+        return "Backend: local"
+
+    traced = _backend_marker_from_trace(response=response, api_model=api_model)
+    if traced == "api":
+        return "Backend: api"
+    if traced == "local":
+        return "Backend: local"
+
+    requested_backend = _normalized_model_backend(model_backend)
+    if requested_backend == "api":
+        return "Backend: api"
+    if requested_backend == "local":
+        return "Backend: local"
+
+    if str(api_key or "").strip():
+        return "Backend: api (auto)"
+    return "Backend: local (auto)"
 
 
 def _request_chat_response(
@@ -496,8 +706,27 @@ def _request_chat_response(
     placeholder: Any,
 ) -> dict[str, Any]:
     try:
-        return _consume_streamed_response(
-            events=api.ask_stream_events(
+        response = _consume_streamed_response(
+            events=_events_with_wait_feedback(
+                events=api.ask_stream_events(
+                    question=prompt,
+                    mode=chat_mode,
+                    document_id=document_id,
+                    session_id=session_id,
+                    model_backend=model_backend,
+                    api_key=api_key,
+                    api_model=api_model,
+                ),
+                mode=chat_mode,
+            ),
+            placeholder=placeholder,
+            mode=chat_mode,
+            document_id=document_id,
+        )
+        return response
+    except ApiError as stream_error:
+        if stream_error.status_code == 404:
+            response = api.ask(
                 question=prompt,
                 mode=chat_mode,
                 document_id=document_id,
@@ -505,25 +734,39 @@ def _request_chat_response(
                 model_backend=model_backend,
                 api_key=api_key,
                 api_model=api_model,
-            ),
-            placeholder=placeholder,
-            mode=chat_mode,
-            document_id=document_id,
-        )
-    except ApiError as stream_error:
-        if stream_error.status_code != 404:
-            raise
-        response = api.ask(
-            question=prompt,
-            mode=chat_mode,
-            document_id=document_id,
-            session_id=session_id,
+            )
+            placeholder.markdown(str(response.get("answer", "")))
+            return response
+
+        if _should_retry_with_local_model(
+            error=stream_error,
+            chat_mode=chat_mode,
             model_backend=model_backend,
-            api_key=api_key,
-            api_model=api_model,
-        )
-        placeholder.markdown(str(response.get("answer", "")))
-        return response
+        ):
+            placeholder.markdown(
+                "_API deep model unavailable; retrying with local model..._"
+            )
+            response = _consume_streamed_response(
+                events=_events_with_wait_feedback(
+                    events=api.ask_stream_events(
+                        question=prompt,
+                        mode=chat_mode,
+                        document_id=document_id,
+                        session_id=session_id,
+                        model_backend="local",
+                        api_key=None,
+                        api_model=None,
+                    ),
+                    mode=chat_mode,
+                ),
+                placeholder=placeholder,
+                mode=chat_mode,
+                document_id=document_id,
+            )
+            response["_response_backend"] = "local-fallback"
+            return response
+
+        raise
 
 
 def _is_document_not_ready_error(error: ApiError) -> bool:
@@ -535,6 +778,7 @@ def _wait_for_document_indexed(
     api: DocumentInsightApi,
     document_id: str,
     placeholder: Any,
+    progress_placeholder: Any | None = None,
     timeout_seconds: float = 1800.0,
     poll_interval_seconds: float = 1.0,
 ) -> dict[str, Any]:
@@ -544,6 +788,7 @@ def _wait_for_document_indexed(
     while time.monotonic() < deadline:
         latest = api.get_ingest_status(document_id=document_id)
         status = str(latest.get("status") or "unknown")
+        normalized_status = status.lower()
         message = str(latest.get("message") or "").strip()
         progress = latest.get("progress")
 
@@ -554,22 +799,24 @@ def _wait_for_document_indexed(
             file_path=str(latest.get("file_path") or "").strip(),
         )
 
-        if progress and isinstance(progress, dict):
-            stage = str(progress.get("stage", "unknown"))
-            processed = int(progress.get("processed_items") or 0)
-            total = int(progress.get("total_items") or 0)
-            if total > 0:
-                percent = min(100, int((processed / total) * 100))
-                placeholder.markdown(
-                    f"_Indexing status: {status} ({stage}: {processed}/{total} - {percent}%)_"
-                )
-            else:
-                placeholder.markdown(f"_Indexing status: {status} ({stage})_")
+        progress_percent, progress_message = normalize_ingest_progress(progress)
+        if progress_message:
+            placeholder.markdown(f"_Indexing status: {status} ({progress_message})_")
         else:
             suffix = f": {message}" if message else ""
             placeholder.markdown(f"_Indexing status: {status}{suffix}_")
 
-        normalized_status = status.lower()
+        if progress_placeholder is not None:
+            if progress_percent is not None:
+                progress_placeholder.progress(
+                    progress_percent,
+                    text=f"Indexing progress: {progress_percent}%",
+                )
+            elif normalized_status == "indexed":
+                progress_placeholder.progress(100, text="Indexing complete")
+            elif normalized_status in {"failed", "partial"}:
+                progress_placeholder.empty()
+
         if normalized_status == "indexed":
             return latest
         if normalized_status in {"failed", "partial"}:

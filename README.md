@@ -36,7 +36,7 @@ These are synthetic fixtures and contain no sensitive data.
 
 Runtime behavior is profile-driven and shared by local hybrid and Docker:
 
-- `.env.profile.lite` (default): no Docling, no Google parser, fallback-only parser routing, LangExtract disabled.
+- `.env.profile.lite` (default): no Docling, no Google parser, fallback-only parser routing, LangExtract enabled.
 - `.env.profile.full` (opt-in): Docling + LangExtract enabled, Google parser optional when key is present.
 - `.env`: secrets only (`CLOUD_AGENT_API_KEY`, `GOOGLE_API_KEY`).
 
@@ -114,9 +114,14 @@ Current API endpoints:
 Deep mode capability:
 
 - Deep mode is disabled by default at runtime.
-- Enable with env vars:
-  - local deep agent: `DEEP_MODE_ENABLED=true` and `CLOUD_AGENT_PROVIDER=local`
-  - Gemini deep agent: `DEEP_MODE_ENABLED=true`, `CLOUD_AGENT_PROVIDER=gemini`, and `CLOUD_AGENT_API_KEY=...` (or `GOOGLE_API_KEY=...`)
+- Enable with env vars: `DEEP_MODE_ENABLED=true`
+- Chat model routing defaults to `auto`:
+  - when API key is available (`CLOUD_AGENT_API_KEY` or `GOOGLE_API_KEY`), fast/deep use `CLOUD_AGENT_MODEL` (default `gemini-2.5-flash`)
+  - when API key is missing, fast/deep fall back to local models (`LOCAL_LLM_MODEL` / `LOCAL_DEEP_MODEL`)
+- Per-request overrides are supported through headers:
+  - `x-model-backend: auto|api|local`
+  - `x-api-key: <key>`
+  - `x-api-model: <model>`
 
 Full-feature runtime profile:
 
@@ -125,13 +130,11 @@ Full-feature runtime profile:
 - Install optional dependencies for full parser stack:
   `python -m pip install -e .[ai,ui,dev]`
 - Keep Redis and Ollama running (`docker compose up -d redis ollama` or equivalent)
-- For local deep mode via Ollama:
+- For local-first fallback with optional API acceleration:
   - `DEEP_MODE_ENABLED=true`
-  - `CLOUD_AGENT_PROVIDER=local`
-- For Gemini deep mode + Google parser routing:
-  - `DEEP_MODE_ENABLED=true`
-  - `CLOUD_AGENT_PROVIDER=gemini`
-  - `CLOUD_AGENT_API_KEY=<your key>` (or `GOOGLE_API_KEY=<your key>`)
+  - optional planner override: `LOCAL_DEEP_MODEL=qwen2.5:7b-instruct` (defaults to `LOCAL_LLM_MODEL` when unset)
+  - optional API key: `CLOUD_AGENT_API_KEY=<your key>` (or `GOOGLE_API_KEY=<your key>`)
+  - optional API model override: `CLOUD_AGENT_MODEL=gemini-2.5-flash`
 - For structured extraction with LangExtract:
   - `LANGEXTRACT_ENABLED=true` (default)
   - ensure `langextract` package/runtime credentials are available

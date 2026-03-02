@@ -39,3 +39,13 @@ models/*
 
 # OS specific
 .DS_Store
+
+# AOC tracking policy (managed by aoc-init)
+!/.aoc/
+!/.aoc/**
+!/.taskmaster/
+!/.taskmaster/**
+!/.pi/
+!/.pi/**
+
+

@@ -15,6 +15,12 @@ def test_chat_request_rejects_empty_question() -> None:
         ChatRequest(question="")
 
 
+def test_chat_request_accepts_deep_lite_mode() -> None:
+    payload = ChatRequest(question="Summarize findings", mode="deep-lite")
+
+    assert payload.mode is Mode.DEEP_LITE
+
+
 def test_agent_trace_caps_iterations() -> None:
     with pytest.raises(ValidationError):
         AgentTrace(model="gemini-2.0-flash", iterations=6)

@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import pytest
 from pathlib import Path
-from typing import Any
-from fastapi.testclient import TestClient
 
 from src.models.schemas import IngestionStatus
 

@@ -91,7 +91,7 @@ def test_ask_sends_model_routing_headers_when_provided() -> None:
         assert request.url.path == "/ask"
         assert request.headers["x-model-backend"] == "api"
         assert request.headers["x-api-key"] == "key-123"
-        assert request.headers["x-api-model"] == "gemini-3-flash"
+        assert request.headers["x-api-model"] == "gemini-2.5-flash"
         return httpx.Response(
             200,
             json={
@@ -116,7 +116,7 @@ def test_ask_sends_model_routing_headers_when_provided() -> None:
         document_id="doc_123",
         model_backend="api",
         api_key="key-123",
-        api_model="gemini-3-flash",
+        api_model="gemini-2.5-flash",
     )
 
     assert response["answer"] == "ok"

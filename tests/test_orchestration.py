@@ -7,7 +7,6 @@ from src.config.settings import Settings
 from src.ingestion.chunking import ChildChunk, ChunkingResult, ParentChunk
 from src.ingestion.extraction import ExtractionResult, PageText
 from src.ingestion.indexing import (
-    EmbeddingTier,
     HybridVectorIndexStore,
     InMemoryIndexBackend,
     IndexRecord,

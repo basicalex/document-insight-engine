@@ -4,7 +4,7 @@ import os
 from typing import Any, MutableMapping
 
 
-ALLOWED_MODES = ("fast", "deep")
+ALLOWED_MODES = ("fast", "deep-lite", "deep")
 DEFAULT_API_BASE_URL = "http://localhost:8000"
 DEFAULT_EXTRACTION_SCHEMA = (
     "{\n"
@@ -35,8 +35,8 @@ def initialize_session_state(state: MutableMapping[Any, Any]) -> None:
     state.setdefault("extract_schema_text", DEFAULT_EXTRACTION_SCHEMA)
     state.setdefault("extract_prompt", "Extract requested fields with provenance")
     state.setdefault("last_extract_result", None)
-    state.setdefault("model_backend", "auto")
-    state.setdefault("api_model", "gemini-3-flash")
+    state.setdefault("model_backend", "local")
+    state.setdefault("api_model", "gemini-2.5-flash")
     state.setdefault("api_key", "")
 
 
@@ -62,6 +62,7 @@ def append_assistant_message(
     insufficient_evidence: bool,
     citations: list[dict[str, Any]] | None,
     trace: dict[str, Any] | None,
+    backend_label: str | None = None,
 ) -> None:
     state["messages"].append(
         {
@@ -71,6 +72,7 @@ def append_assistant_message(
             "insufficient_evidence": insufficient_evidence,
             "citations": citations or [],
             "trace": trace,
+            "backend_label": backend_label,
         }
     )
 

@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from src.tools.fs_tools import MarkdownFSTools
+from pathlib import Path
+
+from src.config.settings import Settings
+from src.tools.fs_tools import MarkdownFSTools, get_fs_tools, load_markdown_scope
 
 
 _MARKDOWN = """# Master Service Agreement
@@ -68,3 +71,46 @@ def test_keyword_grep_returns_line_spans_and_no_match_error() -> None:
     assert "late fee" in match["snippet"].lower()
     assert miss["ok"] is False
     assert miss["error"]["code"] == "no_matches"
+
+
+def test_get_fs_tools_supports_all_documents_scope(tmp_path: Path) -> None:
+    cfg = Settings(data_dir=tmp_path)
+    cfg.ensure_runtime_dirs()
+
+    (cfg.parsed_dir / "doc-1.md").write_text(
+        "# First Document\n\nContent about plants.",
+        encoding="utf-8",
+    )
+    (cfg.parsed_dir / "doc-2.md").write_text(
+        "# Second Document\n\nContent about cognition.",
+        encoding="utf-8",
+    )
+
+    tools = get_fs_tools("__all_documents__", cfg=cfg)
+
+    sections = tools["list_sections"]()
+    assert sections["ok"] is True
+    assert sections["document_id"] == "all-documents"
+    titles = [section["title"] for section in sections["sections"]]
+    assert "First Document" in titles
+    assert "Second Document" in titles
+
+
+def test_load_markdown_scope_returns_document_text_for_single_and_all_scope(
+    tmp_path: Path,
+) -> None:
+    cfg = Settings(data_dir=tmp_path)
+    cfg.ensure_runtime_dirs()
+
+    (cfg.parsed_dir / "doc-1.md").write_text(
+        "# First Document\n\nContent about plants.",
+        encoding="utf-8",
+    )
+
+    single_document_id, single_text = load_markdown_scope("doc-1", cfg=cfg)
+    all_document_id, all_text = load_markdown_scope("__all_documents__", cfg=cfg)
+
+    assert single_document_id == "doc-1"
+    assert "Content about plants." in single_text
+    assert all_document_id == "all-documents"
+    assert "First Document" in all_text

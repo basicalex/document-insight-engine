@@ -8,7 +8,7 @@ import mimetypes
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Callable
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, File, Header, Request, Response, UploadFile
@@ -71,9 +71,13 @@ from src.models.schemas import (
     StructuredValidationDiagnostic,
     UploadBatchResponse,
 )
+from src.tools.fs_tools import MarkdownFSTools, get_fs_tools, load_markdown_scope
 
 
 logger = logging.getLogger(__name__)
+
+
+_PINNED_GEMINI_API_MODEL = "gemini-2.5-flash"
 
 
 class ApiError(Exception):
@@ -351,6 +355,13 @@ def _build_default_services(cfg: Settings) -> ApiServices:
         telemetry=telemetry,
     )
 
+    structured_extractor = Tier4StructuredExtractor(
+        cfg=cfg,
+        max_input_tokens=cfg.extraction_max_input_tokens,
+        max_output_tokens=cfg.extraction_max_output_tokens,
+        strict_schema=cfg.extraction_strict_schema,
+    )
+
     return ApiServices(
         cfg=cfg,
         intake=UploadIntakeService(cfg),
@@ -365,14 +376,16 @@ def _build_default_services(cfg: Settings) -> ApiServices:
             ),
             query_vector_dimension=cfg.local_embedding_dimension,
         ),
-        cloud_agent=CloudAgentEngine(model_client=model_client, cfg=cfg),
-        state_store=state_store,
-        structured_extractor=Tier4StructuredExtractor(
+        cloud_agent=CloudAgentEngine(
+            model_client=model_client,
+            tool_provider=_build_agent_tool_provider(
+                cfg=cfg,
+                structured_extractor=structured_extractor,
+            ),
             cfg=cfg,
-            max_input_tokens=cfg.extraction_max_input_tokens,
-            max_output_tokens=cfg.extraction_max_output_tokens,
-            strict_schema=cfg.extraction_strict_schema,
         ),
+        state_store=state_store,
+        structured_extractor=structured_extractor,
         orchestrator=orchestrator,
         ingestion_worker_pool=ingestion_worker_pool,
         telemetry=telemetry,
@@ -973,10 +986,12 @@ async def ask(
                 routing=routing,
             )
             chat_response = await _ask_with_timeout(
-                handler=lambda: deep_engine.ask(
+                handler=lambda: _invoke_agent_ask(
+                    engine=deep_engine,
                     question=payload.question,
                     mode=payload.mode,
                     document_id=payload.document_id,
+                    chat_history=chat_history,
                 ),
                 timeout_seconds=services.cfg.request_timeout_seconds,
             )
@@ -995,15 +1010,56 @@ async def ask(
                     routing=_local_chat_routing(services.cfg),
                 )
                 chat_response = await _ask_with_timeout(
-                    handler=lambda: fallback_engine.ask(
+                    handler=lambda: _invoke_agent_ask(
+                        engine=fallback_engine,
                         question=payload.question,
                         mode=payload.mode,
                         document_id=payload.document_id,
+                        chat_history=chat_history,
                     ),
                     timeout_seconds=services.cfg.request_timeout_seconds,
                 )
 
             _raise_if_deep_provider_failed(chat_response)
+        elif payload.mode == Mode.DEEP_LITE:
+            deep_lite_engine = _resolve_deep_lite_engine_for_request(
+                services=services,
+                routing=routing,
+            )
+            chat_response = await _ask_with_timeout(
+                handler=lambda: _invoke_agent_ask(
+                    engine=deep_lite_engine,
+                    question=payload.question,
+                    mode=payload.mode,
+                    document_id=payload.document_id,
+                    chat_history=chat_history,
+                ),
+                timeout_seconds=services.cfg.request_timeout_seconds,
+            )
+
+            if _should_auto_fallback_to_local(
+                routing=routing,
+                response=chat_response,
+                mode=Mode.DEEP_LITE,
+            ):
+                logger.warning(
+                    "Deep-lite API model failed (%s); retrying with local backend",
+                    _termination_reason(chat_response),
+                )
+                fallback_engine = _resolve_deep_lite_engine_for_request(
+                    services=services,
+                    routing=_local_chat_routing(services.cfg),
+                )
+                chat_response = await _ask_with_timeout(
+                    handler=lambda: _invoke_agent_ask(
+                        engine=fallback_engine,
+                        question=payload.question,
+                        mode=payload.mode,
+                        document_id=payload.document_id,
+                        chat_history=chat_history,
+                    ),
+                    timeout_seconds=services.cfg.request_timeout_seconds,
+                )
         else:
             fast_engine = _resolve_fast_engine_for_request(
                 services=services,
@@ -1022,7 +1078,7 @@ async def ask(
             if _should_auto_fallback_to_local(
                 routing=routing,
                 response=chat_response,
-                mode=Mode.FAST,
+                mode=payload.mode,
             ):
                 logger.warning(
                     "Fast API model failed (%s); retrying with local backend",
@@ -1113,10 +1169,12 @@ async def ask_stream(
                 routing=routing,
             )
             response = await _ask_with_timeout(
-                handler=lambda: deep_engine.ask(
+                handler=lambda: _invoke_agent_ask(
+                    engine=deep_engine,
                     question=payload.question,
                     mode=payload.mode,
                     document_id=payload.document_id,
+                    chat_history=chat_history,
                 ),
                 timeout_seconds=services.cfg.request_timeout_seconds,
             )
@@ -1135,15 +1193,58 @@ async def ask_stream(
                     routing=_local_chat_routing(services.cfg),
                 )
                 response = await _ask_with_timeout(
-                    handler=lambda: fallback_engine.ask(
+                    handler=lambda: _invoke_agent_ask(
+                        engine=fallback_engine,
                         question=payload.question,
                         mode=payload.mode,
                         document_id=payload.document_id,
+                        chat_history=chat_history,
                     ),
                     timeout_seconds=services.cfg.request_timeout_seconds,
                 )
 
             _raise_if_deep_provider_failed(response)
+            events = _single_response_events(response)
+        elif payload.mode == Mode.DEEP_LITE:
+            deep_lite_engine = _resolve_deep_lite_engine_for_request(
+                services=services,
+                routing=routing,
+            )
+            response = await _ask_with_timeout(
+                handler=lambda: _invoke_agent_ask(
+                    engine=deep_lite_engine,
+                    question=payload.question,
+                    mode=payload.mode,
+                    document_id=payload.document_id,
+                    chat_history=chat_history,
+                ),
+                timeout_seconds=services.cfg.request_timeout_seconds,
+            )
+
+            if _should_auto_fallback_to_local(
+                routing=routing,
+                response=response,
+                mode=Mode.DEEP_LITE,
+            ):
+                logger.warning(
+                    "Deep-lite API model failed (%s); retrying stream response with local backend",
+                    _termination_reason(response),
+                )
+                fallback_engine = _resolve_deep_lite_engine_for_request(
+                    services=services,
+                    routing=_local_chat_routing(services.cfg),
+                )
+                response = await _ask_with_timeout(
+                    handler=lambda: _invoke_agent_ask(
+                        engine=fallback_engine,
+                        question=payload.question,
+                        mode=payload.mode,
+                        document_id=payload.document_id,
+                        chat_history=chat_history,
+                    ),
+                    timeout_seconds=services.cfg.request_timeout_seconds,
+                )
+
             events = _single_response_events(response)
         else:
             fast_engine = _resolve_fast_engine_for_request(
@@ -1163,7 +1264,7 @@ async def ask_stream(
                 if _should_auto_fallback_to_local(
                     routing=routing,
                     response=response,
-                    mode=Mode.FAST,
+                    mode=payload.mode,
                 ):
                     logger.warning(
                         "Fast API model failed (%s); retrying stream response with local backend",
@@ -1568,6 +1669,232 @@ def _persist_extraction_artifact(
     return str(artifact_path)
 
 
+def _build_agent_tool_provider(
+    *,
+    cfg: Settings,
+    structured_extractor: Tier4StructuredExtractor | None,
+) -> Callable[[str], dict[str, Any]]:
+    def provider(document_id: str) -> dict[str, Any]:
+        tools = get_fs_tools(document_id, cfg=cfg)
+        if structured_extractor is None:
+            return tools
+
+        def structured_extract_tool(
+            schema: dict[str, Any],
+            prompt: str | None = None,
+            section_key: str | None = None,
+            max_chars: int | None = None,
+        ) -> dict[str, Any]:
+            return _run_structured_extract_tool(
+                document_id=document_id,
+                schema=schema,
+                prompt=prompt,
+                section_key=section_key,
+                max_chars=max_chars,
+                cfg=cfg,
+                structured_extractor=structured_extractor,
+            )
+
+        tools["structured_extract"] = structured_extract_tool
+        return tools
+
+    return provider
+
+
+def _run_structured_extract_tool(
+    *,
+    document_id: str,
+    schema: dict[str, Any],
+    prompt: str | None,
+    section_key: str | None,
+    max_chars: int | None,
+    cfg: Settings,
+    structured_extractor: Tier4StructuredExtractor,
+) -> dict[str, Any]:
+    if not isinstance(schema, dict):
+        return {
+            "ok": False,
+            "document_id": document_id,
+            "error": {
+                "code": "invalid_schema",
+                "message": "structured_extract.schema must be an object",
+                "details": {},
+            },
+        }
+
+    if max_chars is not None and (not isinstance(max_chars, int) or max_chars <= 0):
+        return {
+            "ok": False,
+            "document_id": document_id,
+            "error": {
+                "code": "invalid_max_chars",
+                "message": "structured_extract.max_chars must be a positive integer",
+                "details": {"max_chars": max_chars},
+            },
+        }
+
+    try:
+        scoped_document_id, document_text = load_markdown_scope(document_id, cfg=cfg)
+    except FileNotFoundError as exc:
+        return {
+            "ok": False,
+            "document_id": document_id,
+            "error": {
+                "code": "document_not_found",
+                "message": str(exc),
+                "details": {},
+            },
+        }
+
+    extraction_text = document_text
+    selected_section_key: str | None = None
+
+    normalized_section_key = (section_key or "").strip()
+    if normalized_section_key:
+        scoped_tools = MarkdownFSTools(
+            document_id=scoped_document_id,
+            markdown_text=document_text,
+        )
+        section_result = scoped_tools.read_section(
+            section_key=normalized_section_key,
+            max_chars=max_chars,
+        )
+        if bool(section_result.get("ok")) is not True:
+            return {
+                "ok": False,
+                "document_id": scoped_document_id,
+                "error": section_result.get("error")
+                or {
+                    "code": "section_not_found",
+                    "message": "requested section was not found",
+                    "details": {"section_key": normalized_section_key},
+                },
+            }
+
+        extraction_text = str(section_result.get("content", ""))
+        selected_section_key = normalized_section_key
+    elif max_chars is not None:
+        extraction_text = extraction_text[:max_chars]
+
+    extraction_text, budget_truncated = _fit_text_to_extraction_budget(
+        document_text=extraction_text,
+        schema=schema,
+        prompt=prompt,
+        cfg=cfg,
+    )
+
+    source_metadata = {
+        "section_key": selected_section_key,
+        "input_char_count": len(extraction_text),
+        "input_was_truncated": budget_truncated,
+    }
+
+    try:
+        envelope = structured_extractor.extract_structured(
+            document_id=scoped_document_id,
+            document_text=extraction_text,
+            schema=schema,
+            prompt=prompt,
+        )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "document_id": scoped_document_id,
+            "error": {
+                "code": "provider_error",
+                "message": f"structured extraction provider failed: {exc}",
+                "details": {"source": source_metadata},
+            },
+        }
+
+    if not envelope.ok or envelope.result is None:
+        error = envelope.error
+        if error is None:
+            return {
+                "ok": False,
+                "document_id": scoped_document_id,
+                "error": {
+                    "code": "structured_extraction_failed",
+                    "message": "structured extraction failed unexpectedly",
+                    "details": {"source": source_metadata},
+                },
+            }
+        return {
+            "ok": False,
+            "document_id": scoped_document_id,
+            "error": {
+                "code": error.code,
+                "message": error.message,
+                "details": {
+                    "diagnostics": [
+                        {
+                            "code": item.code,
+                            "message": item.message,
+                            "field": item.field,
+                            "details": item.details,
+                        }
+                        for item in error.diagnostics
+                    ],
+                    "token_usage": error.token_usage,
+                    "latency_ms": error.latency_ms,
+                    "source": source_metadata,
+                },
+            },
+        }
+
+    return {
+        "ok": True,
+        "document_id": envelope.result.document_id,
+        "model": envelope.result.model,
+        "prompt_version": envelope.result.prompt_version,
+        "data": envelope.result.data,
+        "provenance": {
+            key: {
+                "start_offset": value.start_offset,
+                "end_offset": value.end_offset,
+                "text": value.text,
+            }
+            for key, value in envelope.result.provenance.items()
+        },
+        "accepted_fields": envelope.result.accepted_fields,
+        "rejected_fields": envelope.result.rejected_fields,
+        "diagnostics": [
+            {
+                "code": item.code,
+                "message": item.message,
+                "field": item.field,
+                "details": item.details,
+            }
+            for item in envelope.result.diagnostics
+        ],
+        "token_usage": envelope.result.token_usage,
+        "latency_ms": envelope.result.latency_ms,
+        "source": source_metadata,
+    }
+
+
+def _fit_text_to_extraction_budget(
+    *,
+    document_text: str,
+    schema: dict[str, Any],
+    prompt: str | None,
+    cfg: Settings,
+) -> tuple[str, bool]:
+    schema_chars = len(json.dumps(schema, sort_keys=True))
+    prompt_chars = len(prompt or "")
+    safety_margin = 512
+    available_chars = max(
+        1024,
+        (int(cfg.extraction_max_input_tokens) * 4)
+        - schema_chars
+        - prompt_chars
+        - safety_margin,
+    )
+    if len(document_text) <= available_chars:
+        return document_text, False
+    return document_text[:available_chars], True
+
+
 def _runtime_dependency_report() -> dict[str, bool]:
     modules = {
         "redisvl": "redisvl",
@@ -1745,6 +2072,10 @@ def _runtime_readiness_report(services: ApiServices) -> dict[str, Any]:
                 "ready": not fast_blockers,
                 "blocking_issues": fast_blockers,
             },
+            "ask_deep_lite": {
+                "ready": not deep_blockers,
+                "blocking_issues": deep_blockers,
+            },
             "ask_deep": {
                 "ready": not deep_blockers,
                 "blocking_issues": deep_blockers,
@@ -1866,7 +2197,15 @@ def _resolve_chat_model_routing(
     api_key = _normalized_header_value(api_key_header) or _normalized_header_value(
         cfg.cloud_agent_api_key
     )
-    api_model = _normalized_header_value(api_model_header) or cfg.cloud_agent_model
+    requested_api_model = _normalized_header_value(api_model_header)
+    api_model = _PINNED_GEMINI_API_MODEL
+
+    if requested_api_model and requested_api_model != _PINNED_GEMINI_API_MODEL:
+        logger.info(
+            "Ignoring requested API model '%s'; using pinned model '%s'",
+            requested_api_model,
+            _PINNED_GEMINI_API_MODEL,
+        )
 
     if backend == "api" and not api_key:
         raise ApiError(
@@ -1926,7 +2265,7 @@ def _should_auto_fallback_to_local(
     if not reason:
         return False
 
-    if mode == Mode.DEEP:
+    if mode in {Mode.DEEP, Mode.DEEP_LITE}:
         return reason in _DEEP_PROVIDER_FAILURE_CODES
     return reason == "generation_error"
 
@@ -2010,6 +2349,51 @@ def _resolve_deep_engine_for_request(
         max_iterations=max_iterations,
         model_name=local_model,
         prompt_version=prompt_version,
+    )
+
+
+def _resolve_deep_lite_engine_for_request(
+    *,
+    services: ApiServices,
+    routing: _ChatModelRouting,
+) -> Any:
+    engine = _resolve_deep_engine_for_request(services=services, routing=routing)
+    if not isinstance(engine, CloudAgentEngine):
+        return engine
+
+    max_iterations = min(5, engine.max_iterations)
+    if max_iterations == engine.max_iterations:
+        return engine
+
+    return CloudAgentEngine(
+        model_client=engine.model_client,
+        tool_provider=engine.tool_provider,
+        cfg=engine.cfg,
+        max_iterations=max_iterations,
+        model_name=engine.model_name,
+        prompt_version=engine.prompt_version,
+    )
+
+
+def _invoke_agent_ask(
+    *,
+    engine: Any,
+    question: str,
+    mode: Mode,
+    document_id: str | None,
+    chat_history: list[dict[str, str]],
+) -> ChatResponse:
+    if isinstance(engine, CloudAgentEngine):
+        return engine.ask(
+            question=question,
+            mode=mode,
+            document_id=document_id,
+            chat_history=chat_history,
+        )
+    return engine.ask(
+        question=question,
+        mode=mode,
+        document_id=document_id,
     )
 
 

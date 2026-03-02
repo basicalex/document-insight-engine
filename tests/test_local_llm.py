@@ -1,13 +1,21 @@
 from __future__ import annotations
 
+import io
 from dataclasses import dataclass
 from typing import Any, Iterator
+from urllib import error as urllib_error
+
+import pytest
 
 from src.config.settings import Settings
 from src.engine.local_llm import (
     LocalQAEngine,
+    OllamaGenerateError,
+    OllamaHTTPClient,
     QueryEmbeddingCandidate,
     RetrievedEvidence,
+    _format_gemini_http_error,
+    _local_generation_failure_answer,
     build_rag_prompt,
 )
 from src.ingestion.indexing import QueryMatch
@@ -308,3 +316,127 @@ def test_local_engine_query_candidate_fallback_supports_migration_path() -> None
     assert store.filter_calls[0]["embedding_provider"] == "ollama"
     assert store.filter_calls[1] is not None
     assert store.filter_calls[1]["embedding_provider"] == "hash"
+
+
+def test_local_generation_failure_message_guides_model_pull_for_missing_model() -> None:
+    answer = _local_generation_failure_answer(
+        model="llama3.2:1b",
+        error=OllamaGenerateError(
+            "Ollama request failed with status 404: model 'llama3.2:1b' not found"
+        ),
+    )
+
+    assert 'ollama pull "llama3.2:1b"' in answer
+
+
+def test_local_generation_failure_message_guides_backend_switch_on_api_rate_limit() -> None:
+    answer = _local_generation_failure_answer(
+        model="gemini-2.5-flash",
+        error=OllamaGenerateError("Gemini request failed with status 429"),
+    )
+
+    assert "rate-limited" in answer.lower()
+    assert "local/auto" in answer.lower()
+
+
+def test_format_gemini_http_error_surfaces_provider_message() -> None:
+    payload = (
+        b'{"error":{"code":429,"message":"Quota exceeded for metric: '
+        b'generate_content_free_tier_requests"}}'
+    )
+    exc = urllib_error.HTTPError(
+        url="https://example.test",
+        code=429,
+        msg="Too Many Requests",
+        hdrs=None,
+        fp=io.BytesIO(payload),
+    )
+
+    text = _format_gemini_http_error(exc)
+
+    assert "Gemini request failed with status 429" in text
+    assert "Quota exceeded for metric" in text
+
+
+class KeywordAwareStore:
+    def __init__(self, matches: list[QueryMatch]) -> None:
+        self.matches = matches
+        self.top_k_calls: list[int] = []
+
+    def query(
+        self,
+        tier: object,
+        vector: list[float],
+        top_k: int = 5,
+        filters: dict[str, Any] | None = None,
+    ) -> list[QueryMatch]:
+        del tier, vector, filters
+        self.top_k_calls.append(top_k)
+        return self.matches[:top_k]
+
+
+def test_local_engine_keyword_queries_expand_retrieval_and_promote_keyword_hits() -> None:
+    matches = [
+        QueryMatch(
+            record_id=f"rec-{index}",
+            score=0.9,
+            payload={
+                "chunk_id": f"chunk-{index}",
+                "text": f"generic context block {index}",
+                "page_refs": ["1"],
+                "document_id": "doc-plant",
+            },
+        )
+        for index in range(1, 9)
+    ]
+    matches.append(
+        QueryMatch(
+            record_id="rec-alex",
+            score=0.6,
+            payload={
+                "chunk_id": "chunk-alex",
+                "text": "Alex combines both approaches for dual emotional processing.",
+                "page_refs": ["85"],
+                "document_id": "doc-plant",
+            },
+        )
+    )
+
+    store = KeywordAwareStore(matches=matches)
+    engine = LocalQAEngine(
+        index_store=store,
+        cfg=Settings(),
+        embedder=StubEmbedder(),
+        ollama_client=StubOllama(answer="Alex is an agent variant in the plant study."),
+    )
+
+    response = engine.ask(
+        question="who is alex",
+        mode=Mode.FAST,
+        document_id="doc-plant",
+    )
+
+    assert store.top_k_calls
+    assert store.top_k_calls[0] > engine.retrieval_top_k
+    assert response.insufficient_evidence is False
+    assert response.citations
+    assert response.citations[0].chunk_id == "chunk-alex"
+
+
+def test_ollama_http_client_generate_wraps_timeout_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = OllamaHTTPClient("http://localhost:11434")
+
+    def _raise_timeout(*args: Any, **kwargs: Any) -> Any:
+        del args, kwargs
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr("src.engine.local_llm.urllib_request.urlopen", _raise_timeout)
+
+    with pytest.raises(OllamaGenerateError, match="timed out"):
+        client.generate(
+            model="nomic-embed-text:v1.5",
+            prompt="hello",
+            timeout_seconds=1,
+        )

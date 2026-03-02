@@ -26,3 +26,14 @@ Rules:
 - Never edit `.aoc/memory.md` directly.
 - Never edit `.taskmaster/tasks/tasks.json` directly.
 - Explain any changes before making them.
+
+## Layout Operations
+- Manage project-shared layouts in `.aoc/layouts/`.
+- Prefer `.aoc/layouts/<name>.kdl` over `~/.config/zellij/layouts/<name>.kdl` when names overlap.
+- Validate layouts via `aoc-layout --tab <name>`.
+
+## Theme Operations
+- Manage global themes in `~/.config/zellij/themes/`.
+- Manage project themes in `.aoc/themes/`.
+- Use `aoc-theme tui` for interactive selection (preset + custom sections).
+- Prefer project-scoped themes when names overlap and apply with `aoc-theme apply --scope auto`.

@@ -74,8 +74,14 @@ def _build_local_turn_prompt(
         '{"action":"tool_call","tool_name":"<allowed>","arguments":{...}}\n'
         "2) Final answer: "
         '{"action":"final","answer":"...","insufficient_evidence":true|false}\n\n'
+        "Tool argument contracts:\n"
+        "- list_sections: {\"limit\"?: integer}\n"
+        "- read_section: {\"section_key\": string, \"max_chars\"?: integer}\n"
+        "- keyword_grep: {\"keyword\": string, \"section_key\"?: string, \"max_matches\"?: integer, \"context_chars\"?: integer}\n"
+        "- structured_extract: {\"schema\": object, \"prompt\"?: string, \"section_key\"?: string, \"max_chars\"?: integer} (use for schema-based extraction tasks; set section_key/max_chars on long docs)\n\n"
         "Rules:\n"
         "- Use only allowed tools.\n"
+        "- Use structured_extract when user asks for structured JSON extraction.\n"
         "- If unsure, prefer insufficient_evidence=true in final answer.\n"
         "- Keep answer concise and grounded in tool outputs.\n\n"
         f"question: {question}\n"

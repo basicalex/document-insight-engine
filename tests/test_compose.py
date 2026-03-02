@@ -77,7 +77,7 @@ def test_profile_env_files_define_runtime_contract() -> None:
     assert full["PYTHON_EXTRAS"] == "dev,ui,ai"
     assert lite["DOCLING_ENABLED"] == "false"
     assert full["DOCLING_ENABLED"] == "true"
-    assert lite["LANGEXTRACT_ENABLED"] == "false"
+    assert lite["LANGEXTRACT_ENABLED"] == "true"
     assert full["LANGEXTRACT_ENABLED"] == "true"
 
 

@@ -98,7 +98,6 @@ class GeminiCloudModelClient:
             "tool_config": {"function_calling_config": {"mode": "AUTO"}},
             "generation_config": {
                 "temperature": 0.0,
-                "response_mime_type": "application/json",
             },
         }
 
@@ -329,6 +328,23 @@ def _tool_declarations(allowed_tools: list[str]) -> list[dict[str, Any]]:
                     "section_key": {"type": "STRING"},
                     "max_matches": {"type": "INTEGER"},
                     "context_chars": {"type": "INTEGER"},
+                },
+            },
+        },
+        "structured_extract": {
+            "name": "structured_extract",
+            "description": (
+                "Run schema-based extraction with grounding provenance. "
+                "Use section_key and max_chars for long documents."
+            ),
+            "parameters": {
+                "type": "OBJECT",
+                "required": ["schema"],
+                "properties": {
+                    "schema": {"type": "OBJECT"},
+                    "prompt": {"type": "STRING"},
+                    "section_key": {"type": "STRING"},
+                    "max_chars": {"type": "INTEGER"},
                 },
             },
         },

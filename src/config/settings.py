@@ -116,7 +116,7 @@ class Settings(BaseSettings):
     cloud_agent_provider: Literal["disabled", "fallback", "gemini", "local"] = (
         "disabled"
     )
-    cloud_agent_model: str = "gemini-3-flash"
+    cloud_agent_model: str = "gemini-2.5-flash"
     cloud_agent_api_key: str | None = Field(
         default=None,
         validation_alias=AliasChoices(
