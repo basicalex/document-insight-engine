@@ -55,7 +55,7 @@ This starts:
 - API on `http://localhost:8000`
 - UI on `http://localhost:8501`
 
-Use full profile when you want Docling-enabled parser stack:
+Optional second profile (same lightweight dependency footprint):
 
 ```bash
 ./scripts/dev-full-up.sh
@@ -71,8 +71,8 @@ Use full profile when you want Docling-enabled parser stack:
 
 Profiles:
 
-- `.env.profile.lite` (default): LangExtract on, no Docling
-- `.env.profile.full`: Docling + LangExtract
+- `.env.profile.lite` (default): lightweight runtime (no Docling/LangExtract)
+- `.env.profile.full`: currently same no-CUDA lightweight footprint
 - `.env`: secrets only (e.g. `CLOUD_AGENT_API_KEY`)
 
 ---

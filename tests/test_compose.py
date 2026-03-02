@@ -49,6 +49,7 @@ def test_profile_env_files_define_runtime_contract() -> None:
 
     shared_keys = {
         "DIE_PROFILE",
+        "INSTALL_LANGEXTRACT",
         "INSTALL_DOCLING",
         "PYTHON_EXTRAS",
         "DEEP_MODE_ENABLED",
@@ -73,12 +74,16 @@ def test_profile_env_files_define_runtime_contract() -> None:
 
     assert lite["DIE_PROFILE"] == "lite"
     assert full["DIE_PROFILE"] == "full"
-    assert lite["PYTHON_EXTRAS"] == "dev,ui,ai-lite"
-    assert full["PYTHON_EXTRAS"] == "dev,ui,ai"
+    assert lite["PYTHON_EXTRAS"] == "dev,ui"
+    assert full["PYTHON_EXTRAS"] == "dev,ui"
+    assert lite["INSTALL_LANGEXTRACT"] == "false"
+    assert full["INSTALL_LANGEXTRACT"] == "false"
+    assert lite["INSTALL_DOCLING"] == "false"
+    assert full["INSTALL_DOCLING"] == "false"
     assert lite["DOCLING_ENABLED"] == "false"
-    assert full["DOCLING_ENABLED"] == "true"
-    assert lite["LANGEXTRACT_ENABLED"] == "true"
-    assert full["LANGEXTRACT_ENABLED"] == "true"
+    assert full["DOCLING_ENABLED"] == "false"
+    assert lite["LANGEXTRACT_ENABLED"] == "false"
+    assert full["LANGEXTRACT_ENABLED"] == "false"
 
 
 def test_profile_startup_scripts_exist() -> None:
@@ -94,5 +99,6 @@ def test_dockerfile_installs_optional_ai_dependencies() -> None:
     assert "libgl1" in dockerfile
     assert "libglib2.0-0" in dockerfile
     assert "requirements-ui-runtime.txt" in dockerfile
+    assert "ARG INSTALL_LANGEXTRACT=false" in dockerfile
     assert "ARG INSTALL_DOCLING=false" in dockerfile
     assert "--mount=type=cache,target=/root/.cache/pip" in dockerfile

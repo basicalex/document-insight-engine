@@ -18,9 +18,10 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
 
 COPY pyproject.toml README.md /app/
 
+ARG INSTALL_LANGEXTRACT=false
 ARG INSTALL_DOCLING=false
 
-RUN INSTALL_DOCLING="$INSTALL_DOCLING" python -c "import os, tomllib; from pathlib import Path; data = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8')); extras = data['project'].get('optional-dependencies', {}); include_docling = os.getenv('INSTALL_DOCLING', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}; deps = [*data['project'].get('dependencies', []), *extras.get('ui', []), *extras.get('ai-lite', []), *(extras.get('ai-docling', []) if include_docling else [])]; seen = set(); ordered = [dep for dep in deps if not (dep in seen or seen.add(dep))]; Path('/tmp/requirements-ui-runtime.txt').write_text('\\n'.join(ordered) + '\\n', encoding='utf-8')"
+RUN INSTALL_LANGEXTRACT="$INSTALL_LANGEXTRACT" INSTALL_DOCLING="$INSTALL_DOCLING" python -c "import os, tomllib; from pathlib import Path; data = tomllib.loads(Path('pyproject.toml').read_text(encoding='utf-8')); extras = data['project'].get('optional-dependencies', {}); include_langextract = os.getenv('INSTALL_LANGEXTRACT', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}; include_docling = os.getenv('INSTALL_DOCLING', 'false').strip().lower() in {'1', 'true', 'yes', 'on'}; deps = [*data['project'].get('dependencies', []), *extras.get('ui', []), *(extras.get('ai-lite', []) if include_langextract else []), *(extras.get('ai-docling', []) if include_docling else [])]; seen = set(); ordered = [dep for dep in deps if not (dep in seen or seen.add(dep))]; Path('/tmp/requirements-ui-runtime.txt').write_text('\\n'.join(ordered) + '\\n', encoding='utf-8')"
 
 RUN --mount=type=cache,target=/root/.cache/pip,sharing=locked \
   pip install -r /tmp/requirements-ui-runtime.txt

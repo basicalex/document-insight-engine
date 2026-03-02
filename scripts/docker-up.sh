@@ -11,6 +11,7 @@ PROFILE="${1:-${DIE_PROFILE:-lite}}"
 die_load_profile "${PROFILE}"
 
 export DIE_PROFILE_ENV_FILE=".env.profile.${PROFILE}"
+export INSTALL_LANGEXTRACT="${INSTALL_LANGEXTRACT:-false}"
 export INSTALL_DOCLING="${INSTALL_DOCLING:-false}"
 
 cd "${DIE_REPO_ROOT}"

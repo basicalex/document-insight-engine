@@ -42,11 +42,9 @@ die_load_profile() {
 
 die_python_extras_for_profile() {
   local profile="$1"
-  if [ "${profile}" = "full" ]; then
-    printf "dev,ui,ai"
-  else
-    printf "dev,ui,ai-lite"
-  fi
+  # profile is currently unused; keep signature stable for callers
+  : "${profile}"
+  printf "dev,ui"
 }
 
 die_setup_venv() {
@@ -67,13 +65,21 @@ die_require_profile_dependencies() {
   local profile="$1"
   local extras
   local modules
+  local install_langextract
+  local install_docling
 
   extras="${PYTHON_EXTRAS:-$(die_python_extras_for_profile "${profile}")}"
   modules="redisvl uvicorn streamlit"
-  if [ "${profile}" = "full" ]; then
-    modules="${modules} langextract docling"
-  else
+
+  install_langextract="$(printf '%s' "${INSTALL_LANGEXTRACT:-false}" | tr '[:upper:]' '[:lower:]')"
+  install_docling="$(printf '%s' "${INSTALL_DOCLING:-false}" | tr '[:upper:]' '[:lower:]')"
+
+  if [ "${install_langextract}" = "1" ] || [ "${install_langextract}" = "true" ] || [ "${install_langextract}" = "yes" ] || [ "${install_langextract}" = "on" ]; then
     modules="${modules} langextract"
+  fi
+
+  if [ "${install_docling}" = "1" ] || [ "${install_docling}" = "true" ] || [ "${install_docling}" = "yes" ] || [ "${install_docling}" = "on" ]; then
+    modules="${modules} docling"
   fi
 
   if ! python - "$modules" <<'PY'

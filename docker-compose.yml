@@ -35,6 +35,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
+        INSTALL_LANGEXTRACT: ${INSTALL_LANGEXTRACT:-false}
         INSTALL_DOCLING: ${INSTALL_DOCLING:-false}
     env_file:
       - ${DIE_PROFILE_ENV_FILE:-.env.profile.lite}
@@ -65,6 +66,7 @@ services:
       context: .
       dockerfile: Dockerfile
       args:
+        INSTALL_LANGEXTRACT: ${INSTALL_LANGEXTRACT:-false}
         INSTALL_DOCLING: ${INSTALL_DOCLING:-false}
     env_file:
       - ${DIE_PROFILE_ENV_FILE:-.env.profile.lite}
