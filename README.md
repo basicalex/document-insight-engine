@@ -1,315 +1,222 @@
 # Document Insight Engine
 
-Python service for document upload, extraction, and question answering.
+Grounded document QA + extraction service (FastAPI + Redis + Ollama + Streamlit).
 
-## Assignment alignment
+---
 
-This repository is being built for the following core assignment goals:
+## What you get
 
-- `POST /upload`: accept one or more PDF/image docs and store them.
-- `POST /ask`: answer questions from uploaded docs.
-- Dockerized deployment.
-- Repository-committed dummy docs for testing.
+- **Upload + ingest** PDFs/images into a searchable index.
+- **Grounded Q&A** with citations (`/ask`, `/ask/stream`).
+- **Agentic deep modes** with filesystem tools over parsed markdown.
+- **Structured extraction** via `/extract` (schema-driven, provenance-aware).
+- **Operational visibility** via `/healthz`, `/readyz`, `/metrics`.
 
-Current state:
+This repo is optimized for practical local development and Docker deployment.
 
-- Foundation + infrastructure are implemented.
-- Ingestion pipeline is implemented (`/ingest` currently available).
-- `/ingest` now executes extract -> parse -> chunk -> embed -> index before returning status.
-- Engine internals for local QA, agent loop guard, and Tier 4 extraction are implemented.
-- API contracts for `/ingest` and `/ask` are implemented with validation and guardrails.
-- `POST /upload` alias is available for assignment-compatible upload calls.
-- Streamlit UI is available in `frontend/app.py` with chat, structured extraction, runtime readiness, and observability panels.
+---
 
-## Included dummy test docs (committed)
+## Architecture (high level)
 
-See `tests/data/documents/`:
+1. **Ingestion**: upload -> parse -> chunk -> embed -> index.
+2. **Fast mode**: local retrieval + grounded generation.
+3. **Deep modes**: tool-using agent loop (`list_sections`, `read_section`, `keyword_grep`, `structured_extract`).
+4. **State**: Redis-backed API state when available (sessions, idempotency, queue metadata).
 
-- `dummy_invoice.pdf`
-- `dummy_contract.pdf`
-- `dummy_policy.pdf`
-- `dummy_scanned_snippet.png`
+Core modules:
 
-These are synthetic fixtures and contain no sensitive data.
+- `src/api/main.py` — API routes + orchestration
+- `src/ingestion/*` — pipeline stages
+- `src/engine/local_llm.py` — fast grounded QA
+- `src/engine/cloud_agent.py` — deep/deep-lite agent loop
+- `src/engine/extractor.py` — structured extraction
+- `src/tools/fs_tools.py` — deterministic markdown tools
+- `frontend/app.py` — Streamlit chat UI
 
-## Runtime profiles
+---
 
-Runtime behavior is profile-driven and shared by local hybrid and Docker:
+## Quickstart
 
-- `.env.profile.lite` (default): no Docling, no Google parser, fallback-only parser routing, LangExtract enabled.
-- `.env.profile.full` (opt-in): Docling + LangExtract enabled, Google parser optional when key is present.
-- `.env`: secrets only (`CLOUD_AGENT_API_KEY`, `GOOGLE_API_KEY`).
+### Prereqs
 
-## Setup (hybrid local API/UI + Docker infra)
+- Python **3.11+**
+- Docker + Docker Compose
+- (Recommended) `jq` for shell examples
 
-Lite profile (recommended default):
+### Recommended dev flow (local API/UI + Docker infra)
 
 ```bash
 ./scripts/dev-lite-up.sh
 ```
 
-Full profile:
+This starts:
+
+- Redis + Ollama in Docker
+- API on `http://localhost:8000`
+- UI on `http://localhost:8501`
+
+Use full profile when you want Docling-enabled parser stack:
 
 ```bash
 ./scripts/dev-full-up.sh
 ```
 
-Both scripts:
-
-- install profile-matched extras (`.[dev,ui,ai-lite]` for lite, `.[dev,ui,ai]` for full)
-- start `redis` + `ollama` in Docker
-- stop Docker `api`/`ui` if they are running (to avoid port conflicts)
-- run local API (`:8000`) + UI (`:8501`)
-
-## Setup (full Docker)
-
-Lite profile:
+### Full Docker flow
 
 ```bash
 ./scripts/docker-lite-up.sh
-```
-
-Full profile:
-
-```bash
+# or
 ./scripts/docker-full-up.sh
 ```
 
-Compose consumes `${DIE_PROFILE_ENV_FILE:-.env.profile.lite}` for runtime knobs, while `.env` supplies secrets.
+Profiles:
 
-Build caching notes:
+- `.env.profile.lite` (default): LangExtract on, no Docling
+- `.env.profile.full`: Docling + LangExtract
+- `.env`: secrets only (e.g. `CLOUD_AGENT_API_KEY`)
 
-- The Dockerfile installs third-party dependencies before copying `src/` and `frontend/`, so source-only edits do not invalidate heavy dependency layers.
-- Default Docker build installs `ui` + `ai-lite` (LangExtract, no Docling).
-- `INSTALL_DOCLING=true` includes `ai-docling` dependencies.
-- BuildKit cache mounts are enabled for apt and pip layers, so dependency downloads are reused across rebuilds when metadata has not changed.
+---
 
-Services started by compose:
+## 2-minute smoke test
 
-- `api` (FastAPI)
-- `ui` (Streamlit at `http://localhost:8501`)
-- `redis` (persistent volume)
-- `ollama` (model cache under `./models`)
+### 1) Upload
 
-Health and observability endpoints:
+```bash
+curl -sS -X POST http://localhost:8000/upload \
+  -F "files=@tests/data/documents/dummy_invoice.pdf"
+```
 
-- `GET /healthz` includes index readiness, action-specific blockers, deep-provider diagnostics, optional capability notices, and observability snapshot.
-- `GET /readyz` returns `200` only when index backend is ready; degraded mode returns `503`.
-- `GET /metrics` exposes Prometheus-style counters/gauges for latency, queue retries/dead letters, insufficient-evidence rate, and citation completeness.
+### 2) Ask (fast, local)
 
-## API status and contracts
+```bash
+curl -sS -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -H "x-model-backend: local" \
+  -d '{
+    "question": "What is the total due?",
+    "mode": "fast"
+  }'
+```
 
-Current API endpoints:
+### 3) Readiness
+
+```bash
+curl -sS http://localhost:8000/healthz | jq
+curl -sS http://localhost:8000/readyz
+```
+
+---
+
+## Modes and routing
+
+### Answer modes
+
+- `fast` — retrieval-first local QA
+- `deep-lite` — agentic loop with tighter cap
+- `deep` — agentic loop (full configured cap)
+
+### Backend routing (`x-model-backend`)
+
+- `auto` (recommended): API model when key is present, local fallback when needed
+- `api`: force Gemini path
+- `local`: force Ollama/local path
+
+### API model policy
+
+API model is pinned to:
+
+- `gemini-2.5-flash`
+
+`x-api-model` overrides are intentionally ignored.
+
+---
+
+## API surface
 
 - `GET /healthz`
 - `GET /readyz`
 - `GET /metrics`
 - `POST /ingest`
+- `GET /ingests`
 - `GET /ingest/{document_id}`
 - `POST /upload`
 - `POST /ask`
 - `POST /ask/stream`
 - `POST /extract`
 
-Deep mode capability:
+Dummy test fixtures are in `tests/data/documents/`.
 
-- Deep mode is disabled by default at runtime.
-- Enable with env vars: `DEEP_MODE_ENABLED=true`
-- Chat model routing defaults to `auto`:
-  - when API key is available (`CLOUD_AGENT_API_KEY` or `GOOGLE_API_KEY`), fast/deep use `CLOUD_AGENT_MODEL` (default `gemini-2.5-flash`)
-  - when API key is missing, fast/deep fall back to local models (`LOCAL_LLM_MODEL` / `LOCAL_DEEP_MODEL`)
-- Per-request overrides are supported through headers:
-  - `x-model-backend: auto|api|local`
-  - `x-api-key: <key>`
-  - `x-api-model: <model>`
+---
 
-Full-feature runtime profile:
+## Structured extraction
 
-- Install optional dependencies for no-Docling local runtime:
-  `python -m pip install -e .[ai-lite,ui,dev]`
-- Install optional dependencies for full parser stack:
-  `python -m pip install -e .[ai,ui,dev]`
-- Keep Redis and Ollama running (`docker compose up -d redis ollama` or equivalent)
-- For local-first fallback with optional API acceleration:
-  - `DEEP_MODE_ENABLED=true`
-  - optional planner override: `LOCAL_DEEP_MODEL=qwen2.5:7b-instruct` (defaults to `LOCAL_LLM_MODEL` when unset)
-  - optional API key: `CLOUD_AGENT_API_KEY=<your key>` (or `GOOGLE_API_KEY=<your key>`)
-  - optional API model override: `CLOUD_AGENT_MODEL=gemini-2.5-flash`
-- For structured extraction with LangExtract:
-  - `LANGEXTRACT_ENABLED=true` (default)
-  - ensure `langextract` package/runtime credentials are available
-- Verify readiness at runtime with `GET /healthz`:
-  - `deep_provider.ready == true`
-  - `capabilities.google_parser.ready == true` (when using Google parser)
-  - `capabilities.langextract_extractor.ready == true`
+`/extract` accepts:
 
-Parser routing capability:
+- `document_id`
+- JSON schema
+- extraction prompt
 
-- Runtime parser chain is configurable with `PARSER_ROUTING_MODE`.
-- Default Docker order is `fallback_only` to avoid optional parser dependencies.
-- Full parser order is `docling -> google -> fallback` (`docling_google_fallback`).
-- Google parser step requires `CLOUD_AGENT_API_KEY` (or `GOOGLE_API_KEY`); otherwise routing falls through to fallback parser.
-- Successful ingest persists parser output to `data/parsed/<document_id>.md` for deep-mode filesystem tools.
+Deep/deep-lite agents can also call structured extraction as a tool.
 
-Index backend policy:
+---
 
-- API startup now fails fast if Redis/RedisVL index bootstrap is unavailable.
-- Local/dev fallback to in-memory indexing is only allowed when explicitly enabled with `ALLOW_IN_MEMORY_INDEX_FALLBACK=true`.
-- `GET /readyz` reports `200` only when index backend is fully ready; degraded fallback mode reports `503` with diagnostics.
+## Configuration notes
 
-Observability and evaluation:
+Common env knobs:
 
-- Correlation IDs (`x-correlation-id`) are linked with response trace IDs in
-  telemetry for request-to-trace debugging.
-- `GET /metrics` exposes Prometheus-style metrics for HTTP latency/error rates,
-  ingestion retries/dead-letters, and QA grounding/citation quality.
-- Evaluation harness lives at `src/evals/harness.py` with curated fixtures in
-  `tests/data/eval/`.
-- Run the benchmark gate locally:
+- `DEEP_MODE_ENABLED=true`
+- `CLOUD_AGENT_API_KEY=...` (or `GOOGLE_API_KEY`)
+- `CLOUD_AGENT_TIMEOUT_SECONDS` (profile defaults tuned)
+- `API_STATE_BACKEND=auto|redis|memory`
+- `API_STATE_SESSION_MAX_TURNS` (history window)
+
+Session history semantics:
+
+- persisted by `session_id`
+- scoped by `session_id::document_id`
+
+If document scope changes, history scope changes too.
+
+---
+
+## Local model prerequisites (Ollama)
+
+Typical models used in this project:
 
 ```bash
-python -m src.evals.harness \
-  --corpus tests/data/eval/qa_corpus.json \
-  --predictions tests/data/eval/qa_predictions.json \
-  --report-path data/traces/eval_report.json \
-  --assert-thresholds
+ollama pull hadad/LFM2.5-1.2B:Q8_0
+ollama pull nomic-embed-text:v1.5
+ollama pull qwen2.5:7b-instruct
 ```
 
-Contract examples:
+---
 
-Upload request:
+## Developer workflow
 
 ```bash
-curl -X POST http://localhost:8000/upload \
-  -F "files=@tests/data/documents/dummy_invoice.pdf"
+ruff check
+pytest -q
 ```
 
-Expected upload response shape:
+For full-stack validation, use the provided scripts instead of ad-hoc compose commands.
 
-```json
-{
-  "document_id": "doc_123",
-  "file_path": "data/uploads/dummy_invoice.pdf",
-  "status": "uploaded",
-  "message": "queued for processing"
-}
-```
+---
 
-Ask request:
+## Troubleshooting (practical)
 
-```bash
-curl -X POST http://localhost:8000/ask \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "What is the total due?",
-    "mode": "fast",
-    "document_id": "doc_123"
-  }'
-```
+- **Seeing 429 from Gemini**: this is often short-window quota throttling, not necessarily daily budget exhaustion.
+  - Use `x-model-backend: auto` or `local`.
+- **Insufficient evidence**:
+  - select a specific document (avoid all-doc scope for precise Q&A)
+  - ask document-grounded questions
+- **No conversation continuity**:
+  - ensure stable `session_id` in API clients
+  - keep document scope stable
+- **Deep mode provider unavailable**:
+  - verify `/healthz` deep provider readiness and API key config
 
-Expected ask response shape:
+---
 
-```json
-{
-  "answer": "Total due is 1234.00 USD.",
-  "mode": "fast",
-  "document_id": "doc_123",
-  "insufficient_evidence": false,
-  "citations": [
-    {
-      "chunk_id": "chunk-42",
-      "page": 1,
-      "text": "Total Due: 1234.00 USD",
-      "start_offset": 120,
-      "end_offset": 141
-    }
-  ]
-}
-```
+## License / data
 
-## Approach
-
-- **Framework**: FastAPI (typed contracts, async-ready API development).
-- **Extraction**: PyMuPDF first, OCR fallback path for scanned/image-like docs.
-- **QA/RAG**: Local QA baseline + optional deeper retrieval/agentic path.
-- **Infra**: Docker Compose with Redis + Ollama + API, with persistence and limits.
-
-## Docker manual verification checklist
-
-Use this checklist to validate end-to-end behavior manually.
-
-1) Start services and wait for health checks:
-
-```bash
-docker compose up --build -d
-docker compose ps
-```
-
-2) Validate API and Redis reachability:
-
-```bash
-curl http://localhost:8000/healthz
-docker compose exec redis redis-cli ping
-```
-
-3) Upload one document with assignment endpoint:
-
-```bash
-curl -X POST http://localhost:8000/upload \
-  -F "file=@tests/data/documents/dummy_invoice.pdf;type=application/pdf"
-```
-
-4) Upload multiple documents in one request:
-
-```bash
-curl -X POST http://localhost:8000/upload \
-  -F "files=@tests/data/documents/dummy_invoice.pdf;type=application/pdf" \
-  -F "files=@tests/data/documents/dummy_contract.pdf;type=application/pdf"
-```
-
-5) Query ingestion status for a document:
-
-```bash
-curl http://localhost:8000/ingest/<document_id>
-```
-
-6) Ask grounded question in fast mode:
-
-```bash
-curl -X POST http://localhost:8000/ask \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "What is the total due?",
-    "mode": "fast",
-    "document_id": "<document_id>"
-  }'
-```
-
-7) Restart API and re-check persistence:
-
-```bash
-docker compose restart api
-curl http://localhost:8000/ingest/<document_id>
-curl -X POST http://localhost:8000/ask \
-  -H "Content-Type: application/json" \
-  -d '{
-    "question": "What is the total due?",
-    "mode": "fast",
-    "document_id": "<document_id>"
-  }'
-```
-
-## Engine components (implemented)
-
-- `src/engine/local_llm.py`: grounded local QA flow with retrieval-first prompting, insufficient-evidence fallback, and trace metadata.
-- `src/engine/cloud_agent.py`: strict tool-allowlisted agent orchestration (`list_sections`, `read_section`, `keyword_grep`) with hard 5-iteration guard.
-- `src/engine/local_agent_client.py`: Ollama-backed local deep-agent provider for tool-planning fallback when cloud provider is unavailable.
-- `src/engine/extractor.py`: Tier 4 structured extraction adapter with schema validation, per-field provenance offset checks, and token-budget preflight guards.
-- `src/tools/fs_tools.py`: deterministic markdown filesystem tools used by agent reasoning.
-
-## UI coverage
-
-- Upload/ingest status, fast/deep ask, streaming responses, citations, and traces.
-- Structured extraction workflow (`POST /extract`) with schema/prompt controls.
-- Runtime readiness banner backed by `GET /healthz` capability diagnostics.
-- Observability panel showing `GET /healthz` telemetry snapshot and raw `GET /metrics` output.
+Dummy docs in `tests/data/documents/` are synthetic and contain no sensitive data.
